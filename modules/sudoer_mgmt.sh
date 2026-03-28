@@ -17,7 +17,7 @@ _check_sudo_installed() {
     if ! command -v sudo &>/dev/null; then
         log_error "sudo 未安装"
         if confirm "是否现在安装 sudo?"; then
-            apt install -y sudo
+            apt update && apt install -y sudo
             if ! command -v sudo &>/dev/null; then
                 log_error "sudo 安装失败"
                 return 1
