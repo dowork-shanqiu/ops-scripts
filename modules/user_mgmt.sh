@@ -460,7 +460,7 @@ user_modify() {
 _manage_user_ssh_keys() {
     local username="$1"
     local user_home
-    user_home=$(eval echo "~${username}")
+    user_home=$(getent passwd "$username" | cut -d: -f6)
 
     if [ ! -d "$user_home" ]; then
         log_error "用户没有工作目录: ${user_home}"
