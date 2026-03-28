@@ -182,7 +182,19 @@ swap_manage() {
             read_optional "Swap 文件路径" swap_file "/swapfile"
 
             log_step "正在创建 Swap 文件 (${swap_size})..."
-            fallocate -l "$swap_size" "$swap_file" 2>/dev/null || dd if=/dev/zero of="$swap_file" bs=1M count="$(echo "$swap_size" | sed 's/G//' | awk '{print $1 * 1024}')" status=progress
+            if ! fallocate -l "$swap_size" "$swap_file" 2>/dev/null; then
+                # fallocate 失败时使用 dd，支持 G 和 M 单位
+                local dd_count
+                if echo "$swap_size" | grep -qiE '^[0-9]+G$'; then
+                    dd_count=$(echo "$swap_size" | sed 's/[Gg]//' | awk '{print $1 * 1024}')
+                elif echo "$swap_size" | grep -qiE '^[0-9]+M$'; then
+                    dd_count=$(echo "$swap_size" | sed 's/[Mm]//')
+                else
+                    log_error "不支持的大小格式，请使用 G 或 M 作为单位（如: 2G, 512M）"
+                    return 1
+                fi
+                dd if=/dev/zero of="$swap_file" bs=1M count="$dd_count" status=progress
+            fi
             chmod 600 "$swap_file"
             mkswap "$swap_file"
             swapon "$swap_file"

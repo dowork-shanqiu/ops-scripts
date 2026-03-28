@@ -80,7 +80,7 @@ read_nonempty() {
     while true; do
         read -r -p "$(echo -e "${CYAN}${prompt}: ${NC}")" input
         if [ -n "$input" ]; then
-            eval "$varname='$input'"
+            printf -v "$varname" '%s' "$input"
             return 0
         fi
         log_warn "输入不能为空，请重新输入"
@@ -94,9 +94,9 @@ read_optional() {
     local default="$3"
     read -r -p "$(echo -e "${CYAN}${prompt} [默认: ${default}]: ${NC}")" input
     if [ -z "$input" ]; then
-        eval "$varname='$default'"
+        printf -v "$varname" '%s' "$default"
     else
-        eval "$varname='$input'"
+        printf -v "$varname" '%s' "$input"
     fi
 }
 
@@ -165,6 +165,25 @@ get_ssh_service_name() {
         # Debian 及其他使用 sshd
         echo "sshd"
     fi
+}
+
+# ---------- 验证 SSH 公钥格式 ----------
+validate_ssh_pubkey() {
+    local pubkey="$1"
+    # 基本格式检查
+    if ! echo "$pubkey" | grep -qE '^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp[0-9]+) [A-Za-z0-9+/=]+'; then
+        return 1
+    fi
+    # 使用 ssh-keygen 进行验证（如果可用）
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$pubkey" > "$tmpfile"
+    if ssh-keygen -l -f "$tmpfile" > /dev/null 2>&1; then
+        rm -f "$tmpfile"
+        return 0
+    fi
+    rm -f "$tmpfile"
+    return 1
 }
 
 # ---------- 检测系统中可用的 shell ----------

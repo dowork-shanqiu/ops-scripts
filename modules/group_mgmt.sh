@@ -54,12 +54,18 @@ group_add() {
     fi
 
     # 执行创建
-    local cmd="groupadd ${sys_opt} ${gid_opt} ${groupname}"
-    log_info "即将执行: ${cmd}"
+    local cmd_args=()
+    [ -n "$sys_opt" ] && cmd_args+=("$sys_opt")
+    if [ -n "$gid_opt" ]; then
+        # gid_opt is like "-g 1001"
+        cmd_args+=($gid_opt)
+    fi
+    cmd_args+=("$groupname")
+
+    log_info "即将执行: groupadd ${cmd_args[*]}"
 
     if confirm "确认创建用户组?"; then
-        eval "$cmd"
-        if [ $? -eq 0 ]; then
+        if groupadd "${cmd_args[@]}"; then
             log_info "用户组 '${groupname}' 创建成功"
             getent group "$groupname"
 

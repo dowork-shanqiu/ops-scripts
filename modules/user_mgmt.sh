@@ -146,24 +146,38 @@ user_add() {
         log_info "已禁止该用户登录（Shell 设为 nologin）"
     fi
 
-    # --- 构建命令 ---
-    local cmd="useradd"
-    [ -n "$group_opt" ] && cmd="$cmd $group_opt"
-    [ -n "$supp_groups" ] && cmd="$cmd -G $supp_groups"
-    cmd="$cmd $home_opt"
-    cmd="$cmd -s $shell_opt"
-    [ -n "$comment" ] && cmd="$cmd -c \"$comment\""
-    [ -n "$expire_opt" ] && cmd="$cmd $expire_opt"
-    cmd="$cmd $username"
+    # --- 构建并执行命令 ---
+    local cmd_args=()
+    if [ -n "$group_opt" ]; then
+        # group_opt is like "-g groupname"
+        cmd_args+=($group_opt)
+    fi
+    if [ -n "$supp_groups" ]; then
+        cmd_args+=("-G" "$supp_groups")
+    fi
+    if [ "$home_opt" = "-M" ]; then
+        cmd_args+=("-M")
+    else
+        # home_opt is like "-m -d /home/user"
+        cmd_args+=($home_opt)
+    fi
+    cmd_args+=("-s" "$shell_opt")
+    if [ -n "$comment" ]; then
+        cmd_args+=("-c" "$comment")
+    fi
+    if [ -n "$expire_opt" ]; then
+        # expire_opt is like "-e 2025-12-31"
+        cmd_args+=($expire_opt)
+    fi
+    cmd_args+=("$username")
 
     echo ""
     print_thin_separator
-    log_info "即将执行: ${cmd}"
+    log_info "即将执行: useradd ${cmd_args[*]}"
     print_thin_separator
 
     if confirm "确认创建用户?"; then
-        eval "$cmd"
-        if [ $? -eq 0 ]; then
+        if useradd "${cmd_args[@]}"; then
             log_info "用户 '${username}' 创建成功"
 
             # 设置密码（可选）
@@ -178,7 +192,7 @@ user_add() {
                 log_info "由于已禁用密码登录，用户需要 SSH 公钥才能登录"
 
                 local user_home
-                user_home=$(eval echo "~${username}")
+                user_home=$(getent passwd "$username" | cut -d: -f6)
 
                 if [ -d "$user_home" ]; then
                     mkdir -p "${user_home}/.ssh"
@@ -186,7 +200,7 @@ user_add() {
                     local pubkey
                     while true; do
                         read_nonempty "请输入该用户的 SSH 公钥" pubkey
-                        if echo "$pubkey" | grep -qE '^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp[0-9]+) '; then
+                        if validate_ssh_pubkey "$pubkey"; then
                             break
                         fi
                         log_warn "公钥格式不正确，请输入有效的 SSH 公钥"
@@ -477,7 +491,7 @@ _manage_user_ssh_keys() {
             local pubkey
             while true; do
                 read_nonempty "请输入 SSH 公钥" pubkey
-                if echo "$pubkey" | grep -qE '^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp[0-9]+) '; then
+                if validate_ssh_pubkey "$pubkey"; then
                     break
                 fi
                 log_warn "公钥格式不正确"
@@ -504,7 +518,7 @@ _manage_user_ssh_keys() {
             local pubkey
             while true; do
                 read_nonempty "请输入新的 SSH 公钥" pubkey
-                if echo "$pubkey" | grep -qE '^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp[0-9]+) '; then
+                if validate_ssh_pubkey "$pubkey"; then
                     break
                 fi
                 log_warn "公钥格式不正确"

@@ -145,7 +145,7 @@ setup_root_pubkey() {
     while true; do
         read_nonempty "SSH 公钥" pubkey
         # 验证公钥格式
-        if echo "$pubkey" | grep -qE '^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp[0-9]+) '; then
+        if validate_ssh_pubkey "$pubkey"; then
             break
         fi
         log_warn "公钥格式不正确，请输入有效的 SSH 公钥"
