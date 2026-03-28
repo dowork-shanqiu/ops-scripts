@@ -124,11 +124,14 @@ show_menu() {
         echo "    5) ⏰ 定时任务管理"
         echo "    6) ⚙️  系统服务管理"
         echo "    7) 🖥️  主机设置 (主机名/时区/NTP/Swap)"
+        echo "    8) 🌐 Caddy 管理"
+        echo "    9) 🌐 Nginx 管理 (源码编译)"
+        echo "   10) 🔑 Sudoer 管理"
         echo ""
         echo "    0) 退出"
         echo ""
         print_separator
-        select_option "请选择功能" 7 0
+        select_option "请选择功能" 10 0
 
         case "$SELECTED_OPTION" in
             1)
@@ -158,6 +161,18 @@ show_menu() {
             7)
                 source "${MODULES_DIR}/host_mgmt.sh"
                 run_host_mgmt
+                ;;
+            8)
+                source "${MODULES_DIR}/caddy.sh"
+                run_caddy
+                ;;
+            9)
+                source "${MODULES_DIR}/nginx.sh"
+                run_nginx
+                ;;
+            10)
+                source "${MODULES_DIR}/sudoer_mgmt.sh"
+                run_sudoer_mgmt
                 ;;
             0)
                 echo ""

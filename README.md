@@ -20,6 +20,9 @@
   - [定时任务管理](#定时任务管理)
   - [系统服务管理](#系统服务管理)
   - [主机设置](#主机设置)
+  - [Caddy 管理](#caddy-管理)
+  - [Nginx 管理](#nginx-管理)
+  - [Sudoer 管理](#sudoer-管理)
 - [注意事项](#注意事项)
 - [许可证](#许可证)
 
@@ -60,7 +63,10 @@ ops-scripts/
 │   ├── system_info.sh          # 系统信息查看
 │   ├── cron_mgmt.sh            # 定时任务管理
 │   ├── service_mgmt.sh         # 系统服务管理
-│   └── host_mgmt.sh            # 主机设置（主机名/时区/NTP/Swap）
+│   ├── host_mgmt.sh            # 主机设置（主机名/时区/NTP/Swap）
+│   ├── caddy.sh                # Caddy 安装与管理
+│   ├── nginx.sh                # Nginx 源码编译安装与管理
+│   └── sudoer_mgmt.sh          # Sudoer 免密 sudo 配置管理
 ├── README.md                   # 项目文档
 ├── LICENSE                     # 许可证
 └── .gitignore                  # Git 忽略规则
@@ -86,17 +92,16 @@ ops-scripts/
 
 #### 2. 基础工具安装
 
-自动安装以下工具类别：
+自动安装以下基础工具：
 
 | 类别 | 工具 |
 |------|------|
-| 基础工具 | curl, wget, vim, nano, git, rsync, jq, unzip, zip 等 |
-| 网络工具 | net-tools, iproute2, dnsutils, traceroute, mtr, nmap, tcpdump 等 |
-| 系统监控 | htop, iotop, iftop, sysstat, dstat, lsof, strace |
-| 文件与磁盘 | tree, ncdu, parted, dosfstools |
-| 安全工具 | fail2ban, ufw, nftables |
-| 编译工具 | build-essential, software-properties-common |
-| 进程管理 | supervisor, screen, tmux |
+| 基础工具 | curl, wget, vim, git, rsync, jq, unzip, tar |
+| 网络工具 | net-tools, iproute2, dnsutils, nftables |
+| 系统监控 | htop, lsof |
+| 编译工具 | build-essential, software-properties-common, ca-certificates, gnupg, lsb-release |
+| 安全工具 | fail2ban, sudo |
+| 其他 | tmux, cron, logrotate, bash-completion |
 
 #### 3. SSH 安全配置
 
@@ -260,17 +265,116 @@ ops-scripts/
 
 ---
 
+### Caddy 管理
+
+通过官方 APT 源安装 Caddy Web 服务器。
+
+#### 安装
+
+- 自动添加 Caddy 官方 GPG 密钥和 APT 源
+- 安装完成后自动创建配置目录 `/etc/caddy.d`
+- 主配置文件 `/etc/caddy/Caddyfile` 自动引入 `/etc/caddy.d/*.conf`
+- 安装后标记已完成，不会重复安装
+- 提供示例配置文件
+
+#### 管理功能
+
+| 功能 | 说明 |
+|------|------|
+| 安装 Caddy | 通过官方源一键安装 |
+| 查看状态 | 服务状态、配置目录、配置验证 |
+| 服务管理 | 启动/停止/重启/重载配置/查看日志 |
+
+---
+
+### Nginx 管理
+
+通过源码编译安装 Nginx，支持完全自定义。
+
+#### 编译安装
+
+- **编译目录**: `/opt/nginx-compile`
+- **安装目录**: `/usr/local/nginx`
+- **版本选择**: 默认使用最新版本，支持指定版本号
+- **依赖库**: zlib、OpenSSL、PCRE2 均从源码编译，支持指定版本
+- **用户配置**: 支持新建用户/用户组或选择已有用户
+- **编译参数**: 提供默认基础参数，支持选择附加模块或手动输入
+
+##### 默认编译参数
+
+```
+--with-http_ssl_module
+--with-http_v2_module
+--with-http_realip_module
+--with-http_gzip_static_module
+--with-http_stub_status_module
+--with-http_sub_module
+--with-stream
+--with-stream_ssl_module
+--with-pcre=<pcre2源码目录>
+--with-zlib=<zlib源码目录>
+--with-openssl=<openssl源码目录>
+```
+
+##### 可选附加模块
+
+- http_image_filter_module、http_xslt_module、http_geoip_module
+- http_gunzip_module、http_auth_request_module
+- http_dav_module、http_flv_module、http_mp4_module
+- http_secure_link_module、stream_realip_module
+
+#### 管理功能
+
+| 功能 | 说明 |
+|------|------|
+| 编译安装 | 全交互式源码编译安装 |
+| 查看状态 | 版本、服务状态、编译参数、配置验证 |
+| 服务管理 | 启动/停止/重启/重载/验证配置/查看日志 |
+
+---
+
+### Sudoer 管理
+
+管理用户免密码执行 sudo 命令的配置。
+
+- 自动检测 sudo 是否已安装（未安装时提供安装选项）
+- 配置文件存放于 `/etc/sudoers.d/` 目录，以 `ops-` 前缀命名
+- 文件权限自动设置为 `0440`
+- 使用 `visudo -cf` 进行配置验证，保证配置安全
+
+#### 功能
+
+| 功能 | 说明 |
+|------|------|
+| 查看配置 | 列出所有 sudoer 配置及主配置文件摘要 |
+| 添加规则 | 选择用户 → 选择授权方式 → 自动创建配置文件 |
+| 删除规则 | 列出所有规则配置文件供选择删除 |
+| 修改规则 | 追加/删除行/编辑器编辑，变更后自动验证 |
+
+#### 授权方式
+
+- 允许执行所有命令（免密码）
+- 允许执行指定命令（免密码）
+- 允许执行所有命令（需密码）
+- 允许执行指定命令（需密码）
+
+---
+
 ## 注意事项
 
 1. **首次使用务必确认 SSH 配置**：初始化完成后，在断开当前连接之前，请使用新配置测试 SSH 连接，避免因配置错误导致无法登录。
 
 2. **防火墙初始化为一次性操作**：初始化完成后无法重新初始化，后续只能通过规则管理进行修改。
 
-3. **标记文件位置**：系统初始化和防火墙初始化的标记文件存放在 `/etc/ops-scripts/` 目录下。
+3. **标记文件位置**：系统初始化、防火墙初始化、Caddy 安装、Nginx 安装的标记文件存放在 `/etc/ops-scripts/` 目录下。
 
 4. **备份策略**：脚本在修改关键配置（APT 源、SSH 配置、防火墙规则）前会自动备份原始配置。
 
 5. **模块化设计**：每个功能模块独立存放在 `modules/` 目录下，方便维护和扩展。
+
+6. **Nginx 编译安装**：编译过程需要较长时间，取决于服务器性能。编译目录默认为 `/opt/nginx-compile`，安装完成后可以手动清理。
+
+7. **Sudoer 配置安全**：所有 sudoer 配置文件均通过 `visudo` 验证，权限强制为 `0440`，保证系统安全。
 
 ## 许可证
 

@@ -107,42 +107,21 @@ install_base_packages() {
         curl
         wget
         vim
-        nano
         git
         rsync
         jq
         unzip
-        zip
         tar
-        gzip
-        bzip2
 
         # 网络工具
         net-tools
         iproute2
         dnsutils
-        traceroute
-        mtr-tiny
-        iptables
         nftables
-        tcpdump
-        nmap
-        whois
 
         # 系统监控
         htop
-        iotop
-        iftop
-        sysstat
-        dstat
         lsof
-        strace
-
-        # 文件与磁盘
-        tree
-        ncdu
-        parted
-        dosfstools
 
         # 编译与开发
         build-essential
@@ -154,18 +133,13 @@ install_base_packages() {
 
         # 安全工具
         fail2ban
-        ufw
-
-        # 进程管理
-        supervisor
 
         # 其他
-        screen
         tmux
         cron
         logrotate
-        man-db
         bash-completion
+        sudo
     )
 
     apt install -y "${packages[@]}"
