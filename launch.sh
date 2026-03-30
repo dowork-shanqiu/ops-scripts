@@ -90,6 +90,110 @@ run_initialization() {
 }
 
 # ============================================================
+# 脚本更新
+# ============================================================
+GITHUB_REPO="dowork-shanqiu/ops-scripts"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+VERSION_FILE="${SCRIPT_DIR}/.version"
+MIRROR_PREFIX="https://ghproxy.cn/"
+
+update_scripts() {
+    print_separator
+    echo -e "  ${BOLD}脚本更新${NC}"
+    print_separator
+    echo ""
+
+    # 显示当前版本
+    if [ -f "$VERSION_FILE" ]; then
+        local current_version
+        current_version=$(cat "$VERSION_FILE")
+        log_info "当前版本: ${current_version}"
+    else
+        log_warn "未检测到版本信息"
+    fi
+
+    echo ""
+    log_info "检测网络环境..."
+    local use_mirror=false
+    if is_china_network; then
+        log_info "检测到中国大陆网络，使用镜像加速"
+        use_mirror=true
+    fi
+
+    # 获取最新版本
+    log_info "获取最新版本信息..."
+    local latest_tag
+    latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+    if [ -z "$latest_tag" ]; then
+        log_error "无法获取最新版本信息，请检查网络连接"
+        press_any_key
+        return
+    fi
+
+    log_info "最新版本: ${latest_tag}"
+
+    # 检查是否已是最新版本
+    if [ -f "$VERSION_FILE" ]; then
+        if [ "$current_version" = "$latest_tag" ]; then
+            echo ""
+            log_info "当前已是最新版本，无需更新"
+            press_any_key
+            return
+        fi
+    fi
+
+    echo ""
+    if ! confirm "是否更新到版本 ${latest_tag}?"; then
+        return
+    fi
+
+    echo ""
+    local tarball_url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${latest_tag}.tar.gz"
+    if [ "$use_mirror" = true ]; then
+        tarball_url="${MIRROR_PREFIX}${tarball_url}"
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local tmp_file="${tmp_dir}/ops-scripts.tar.gz"
+
+    log_info "正在下载版本 ${latest_tag}..."
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp_file" "$tarball_url"; then
+        rm -rf "$tmp_dir"
+        log_error "下载失败，请检查网络连接"
+        press_any_key
+        return
+    fi
+
+    log_info "正在安装更新..."
+    # 解压到临时目录
+    local extract_dir="${tmp_dir}/extract"
+    mkdir -p "$extract_dir"
+    if ! tar -xzf "$tmp_file" -C "$extract_dir" --strip-components=1; then
+        rm -rf "$tmp_dir"
+        log_error "解压失败"
+        press_any_key
+        return
+    fi
+
+    # 替换安装目录内容
+    rm -rf "${SCRIPT_DIR}/modules"
+    cp -af "$extract_dir"/. "$SCRIPT_DIR"/
+    rm -rf "$tmp_dir"
+
+    # 记录新版本
+    echo "$latest_tag" > "$VERSION_FILE"
+    chmod +x "${SCRIPT_DIR}/launch.sh"
+
+    echo ""
+    log_info "✓ 脚本已更新到版本 ${latest_tag}！"
+    log_info "请重新运行脚本以使更新生效"
+    press_any_key
+}
+
+# ============================================================
 # 主功能菜单
 # ============================================================
 show_menu() {
@@ -128,10 +232,12 @@ show_menu() {
         echo "    9) 🌐 Nginx 管理 (源码编译)"
         echo "   10) 🔑 Sudoer 管理"
         echo ""
+        echo "   11) 🔄 脚本更新"
+        echo ""
         echo "    0) 退出"
         echo ""
         print_separator
-        select_option "请选择功能" 10 0
+        select_option "请选择功能" 11 0
 
         case "$SELECTED_OPTION" in
             1)
@@ -173,6 +279,9 @@ show_menu() {
             10)
                 source "${MODULES_DIR}/sudoer_mgmt.sh"
                 run_sudoer_mgmt
+                ;;
+            11)
+                update_scripts
                 ;;
             0)
                 echo ""

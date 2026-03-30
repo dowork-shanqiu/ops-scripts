@@ -23,6 +23,7 @@
   - [Caddy 管理](#caddy-管理)
   - [Nginx 管理](#nginx-管理)
   - [Sudoer 管理](#sudoer-管理)
+  - [脚本更新](#脚本更新)
 - [注意事项](#注意事项)
 - [许可证](#许可证)
 
@@ -34,10 +35,32 @@
 
 ## 快速开始
 
+### 一键安装（推荐）
+
+通过 `curl` 一键下载并安装到系统中，安装完成后可以直接使用 `ops-scripts` 命令运行：
+
 ```bash
-# 克隆仓库
-git clone https://github.com/dowork-shanqiu/ops-scripts.git
-cd ops-scripts
+curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
+```
+
+安装完成后运行：
+
+```bash
+sudo ops-scripts
+```
+
+> **提示**：安装脚本会自动检测网络环境，中国大陆用户将自动使用镜像加速下载。
+
+### 手动安装
+
+```bash
+# 下载最新版本（将 TAG 替换为实际版本号，如 v1.0.0）
+# 可在 https://github.com/dowork-shanqiu/ops-scripts/releases 查看所有可用版本
+curl -fsSL -o ops-scripts.tar.gz https://github.com/dowork-shanqiu/ops-scripts/archive/refs/tags/TAG.tar.gz
+
+# 解压并进入目录
+tar -xzf ops-scripts.tar.gz
+cd ops-scripts-*
 
 # 赋予执行权限
 chmod +x launch.sh
@@ -46,12 +69,27 @@ chmod +x launch.sh
 sudo bash launch.sh
 ```
 
+### 脚本更新
+
+**方式一：通过主菜单更新**
+
+运行脚本后，在主菜单中选择 `11) 🔄 脚本更新` 即可自动检测并更新到最新版本。
+
+**方式二：重新运行安装命令**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
+```
+
+安装脚本会自动获取最新标签版本并安装。如已是最新版本则跳过。
+
 首次运行时，脚本会自动进入 **系统初始化** 流程。初始化完成后，后续执行将直接进入功能菜单。
 
 ## 项目结构
 
 ```
 ops-scripts/
+├── install.sh                  # 一键安装脚本
 ├── launch.sh                   # 主入口脚本
 ├── modules/                    # 功能模块目录
 │   ├── common.sh               # 公共工具函数（颜色、日志、交互等）
@@ -357,6 +395,17 @@ ops-scripts/
 - 允许执行指定命令（免密码）
 - 允许执行所有命令（需密码）
 - 允许执行指定命令（需密码）
+
+---
+
+### 脚本更新
+
+在主菜单中选择「脚本更新」可将脚本更新到最新版本。
+
+- 自动获取 GitHub 最新发布标签版本
+- 自动检测网络环境，中国大陆用户使用镜像加速
+- 下载对应标签的 tarball 并替换本地文件
+- 也可以重新运行安装命令来更新
 
 ---
 
