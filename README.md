@@ -54,9 +54,12 @@ sudo ops-scripts
 ### 手动安装
 
 ```bash
-# 克隆仓库
-git clone https://github.com/dowork-shanqiu/ops-scripts.git
-cd ops-scripts
+# 下载最新版本（将 TAG 替换为实际版本号，如 v1.0.0）
+curl -fsSL -o ops-scripts.tar.gz https://github.com/dowork-shanqiu/ops-scripts/archive/refs/tags/TAG.tar.gz
+
+# 解压并进入目录
+tar -xzf ops-scripts.tar.gz
+cd ops-scripts-*
 
 # 赋予执行权限
 chmod +x launch.sh
@@ -69,7 +72,7 @@ sudo bash launch.sh
 
 **方式一：通过主菜单更新**
 
-运行脚本后，在主菜单中选择 `11) 🔄 脚本更新` 即可自动更新到最新版本。
+运行脚本后，在主菜单中选择 `11) 🔄 脚本更新` 即可自动检测并更新到最新版本。
 
 **方式二：重新运行安装命令**
 
@@ -77,7 +80,7 @@ sudo bash launch.sh
 curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
 ```
 
-安装脚本会自动检测已有安装并执行更新。
+安装脚本会自动获取最新标签版本并安装。如已是最新版本则跳过。
 
 首次运行时，脚本会自动进入 **系统初始化** 流程。初始化完成后，后续执行将直接进入功能菜单。
 
@@ -398,8 +401,9 @@ ops-scripts/
 
 在主菜单中选择「脚本更新」可将脚本更新到最新版本。
 
+- 自动获取 GitHub 最新发布标签版本
 - 自动检测网络环境，中国大陆用户使用镜像加速
-- 通过 Git 拉取最新代码并重置到最新版本
+- 下载对应标签的 tarball 并替换本地文件
 - 也可以重新运行安装命令来更新
 
 ---

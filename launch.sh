@@ -92,8 +92,10 @@ run_initialization() {
 # ============================================================
 # 脚本更新
 # ============================================================
-REPO_URL="https://github.com/dowork-shanqiu/ops-scripts.git"
-MIRROR_REPO_URL="https://ghproxy.cn/https://github.com/dowork-shanqiu/ops-scripts.git"
+GITHUB_REPO="dowork-shanqiu/ops-scripts"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+VERSION_FILE="${SCRIPT_DIR}/.version"
+MIRROR_PREFIX="https://ghproxy.cn/"
 
 update_scripts() {
     print_separator
@@ -101,48 +103,94 @@ update_scripts() {
     print_separator
     echo ""
 
-    # 检查是否通过 git 安装
-    if [ ! -d "${SCRIPT_DIR}/.git" ]; then
-        log_error "当前安装不支持更新（未检测到 Git 仓库）"
-        log_info "请使用以下命令重新安装："
-        echo ""
-        echo "  curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash"
-        echo ""
-        press_any_key
-        return
-    fi
-
-    # 检查 git 命令
-    if ! command -v git &>/dev/null; then
-        log_error "未找到 git 命令，无法更新"
-        press_any_key
-        return
-    fi
-
-    if ! confirm "是否更新脚本到最新版本?"; then
-        return
+    # 显示当前版本
+    if [ -f "$VERSION_FILE" ]; then
+        local current_version
+        current_version=$(cat "$VERSION_FILE")
+        log_info "当前版本: ${current_version}"
+    else
+        log_warn "未检测到版本信息"
     fi
 
     echo ""
     log_info "检测网络环境..."
-    local origin_url="$REPO_URL"
+    local use_mirror=false
     if is_china_network; then
         log_info "检测到中国大陆网络，使用镜像加速"
-        origin_url="$MIRROR_REPO_URL"
+        use_mirror=true
     fi
 
-    log_info "正在更新..."
-    cd "$SCRIPT_DIR"
-    git remote set-url origin "$origin_url"
-    if git fetch origin main && git reset --hard origin/main; then
-        echo ""
-        log_info "✓ 脚本更新完成！"
-        log_info "部分更新可能需要重新运行脚本才能生效"
-    else
-        echo ""
-        log_error "更新失败，请检查网络连接"
+    # 获取最新版本
+    log_info "获取最新版本信息..."
+    local latest_tag
+    latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+    if [ -z "$latest_tag" ]; then
+        log_error "无法获取最新版本信息，请检查网络连接"
+        press_any_key
+        return
     fi
 
+    log_info "最新版本: ${latest_tag}"
+
+    # 检查是否已是最新版本
+    if [ -f "$VERSION_FILE" ]; then
+        if [ "$current_version" = "$latest_tag" ]; then
+            echo ""
+            log_info "当前已是最新版本，无需更新"
+            press_any_key
+            return
+        fi
+    fi
+
+    echo ""
+    if ! confirm "是否更新到版本 ${latest_tag}?"; then
+        return
+    fi
+
+    echo ""
+    local tarball_url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${latest_tag}.tar.gz"
+    if [ "$use_mirror" = true ]; then
+        tarball_url="${MIRROR_PREFIX}${tarball_url}"
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local tmp_file="${tmp_dir}/ops-scripts.tar.gz"
+
+    log_info "正在下载版本 ${latest_tag}..."
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp_file" "$tarball_url"; then
+        rm -rf "$tmp_dir"
+        log_error "下载失败，请检查网络连接"
+        press_any_key
+        return
+    fi
+
+    log_info "正在安装更新..."
+    # 解压到临时目录
+    local extract_dir="${tmp_dir}/extract"
+    mkdir -p "$extract_dir"
+    if ! tar -xzf "$tmp_file" -C "$extract_dir" --strip-components=1; then
+        rm -rf "$tmp_dir"
+        log_error "解压失败"
+        press_any_key
+        return
+    fi
+
+    # 替换安装目录内容（保留 .version 文件会被覆盖）
+    # 使用 rsync 或手动复制来更新文件
+    rm -rf "${SCRIPT_DIR}/modules"
+    cp -af "$extract_dir"/. "$SCRIPT_DIR"/
+    rm -rf "$tmp_dir"
+
+    # 记录新版本
+    echo "$latest_tag" > "$VERSION_FILE"
+    chmod +x "${SCRIPT_DIR}/launch.sh"
+
+    echo ""
+    log_info "✓ 脚本已更新到版本 ${latest_tag}！"
+    log_info "请重新运行脚本以使更新生效"
     press_any_key
 }
 
