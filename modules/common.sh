@@ -124,9 +124,13 @@ detect_os() {
 # ---------- 检测是否为中国大陆网络 ----------
 is_china_network() {
     # 方式1: 通过 Cloudflare CDN trace 接口检测地理位置（快速且可靠）
-    local api_list="https://blog.cloudflare.com/cdn-cgi/trace https://dash.cloudflare.com/cdn-cgi/trace https://developers.cloudflare.com/cdn-cgi/trace"
+    local api_list=(
+        "https://blog.cloudflare.com/cdn-cgi/trace"
+        "https://dash.cloudflare.com/cdn-cgi/trace"
+        "https://developers.cloudflare.com/cdn-cgi/trace"
+    )
     local ua="Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/81.0"
-    for api_url in $api_list; do
+    for api_url in "${api_list[@]}"; do
         local text
         text="$(curl -A "$ua" -m 5 -s "$api_url" 2>/dev/null)" || continue
         local localize
