@@ -178,8 +178,7 @@ update_scripts() {
         return
     fi
 
-    # 替换安装目录内容（保留 .version 文件会被覆盖）
-    # 使用 rsync 或手动复制来更新文件
+    # 替换安装目录内容
     rm -rf "${SCRIPT_DIR}/modules"
     cp -af "$extract_dir"/. "$SCRIPT_DIR"/
     rm -rf "$tmp_dir"

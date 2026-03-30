@@ -55,6 +55,7 @@ sudo ops-scripts
 
 ```bash
 # 下载最新版本（将 TAG 替换为实际版本号，如 v1.0.0）
+# 可在 https://github.com/dowork-shanqiu/ops-scripts/releases 查看所有可用版本
 curl -fsSL -o ops-scripts.tar.gz https://github.com/dowork-shanqiu/ops-scripts/archive/refs/tags/TAG.tar.gz
 
 # 解压并进入目录

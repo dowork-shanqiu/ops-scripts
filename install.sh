@@ -115,7 +115,6 @@ download_and_install() {
         return 1
     fi
 
-    # 保留标记文件目录（/etc/ops-scripts/ 由系统初始化管理，不受影响）
     # 清理旧安装目录
     if [ -d "$INSTALL_DIR" ]; then
         rm -rf "$INSTALL_DIR"
