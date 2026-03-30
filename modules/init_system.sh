@@ -125,7 +125,6 @@ install_base_packages() {
 
         # 编译与开发
         build-essential
-        software-properties-common
         apt-transport-https
         ca-certificates
         gnupg
@@ -141,6 +140,13 @@ install_base_packages() {
         bash-completion
         sudo
     )
+
+    # software-properties-common 仅在 Ubuntu 上可用（提供 add-apt-repository）
+    # Debian 13+ 的仓库中不包含此包
+    detect_os
+    if [ "$OS_ID" = "ubuntu" ]; then
+        packages+=(software-properties-common)
+    fi
 
     apt install -y "${packages[@]}"
 
