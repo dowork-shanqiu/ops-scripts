@@ -123,20 +123,30 @@ detect_os() {
 
 # ---------- 检测是否为中国大陆网络 ----------
 is_china_network() {
-    # 通过多种方式检测是否处于中国大陆网络
-    # 方式1: 尝试访问国内特有的服务
-    if curl -s --connect-timeout 3 --max-time 5 "https://www.baidu.com" > /dev/null 2>&1; then
-        # 方式2: 检查是否无法快速访问 Google
-        if ! curl -s --connect-timeout 3 --max-time 5 "https://www.google.com" > /dev/null 2>&1; then
-            return 0  # 中国大陆
+    # 方式1: 通过 Cloudflare CDN trace 接口检测地理位置（快速且可靠）
+    local api_list="https://blog.cloudflare.com/cdn-cgi/trace https://dash.cloudflare.com/cdn-cgi/trace https://developers.cloudflare.com/cdn-cgi/trace"
+    local ua="Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/81.0"
+    for api_url in $api_list; do
+        local text
+        text="$(curl -A "$ua" -m 5 -s "$api_url" 2>/dev/null)" || continue
+        local localize
+        localize="$(echo "$text" | sed -n 's/^loc=\([A-Z]*\).*/\1/p')"
+        if [ "$localize" = "CN" ]; then
+            return 0
         fi
-    fi
-    # 方式3: 通过 IP 地理位置查询
+        # 如果成功获取到地理位置但不是 CN，则不再继续尝试
+        if [ -n "$localize" ]; then
+            return 1
+        fi
+    done
+
+    # 方式2: 通过 ipapi.co 查询 IP 归属地（备用）
     local country
-    country=$(curl -s --connect-timeout 5 --max-time 8 "https://ipinfo.io/country" 2>/dev/null)
+    country=$(curl -s --connect-timeout 5 --max-time 8 "https://ipapi.co/country/" 2>/dev/null)
     if [ "$country" = "CN" ]; then
         return 0
     fi
+
     return 1
 }
 

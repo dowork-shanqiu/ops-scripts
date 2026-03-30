@@ -90,6 +90,63 @@ run_initialization() {
 }
 
 # ============================================================
+# 脚本更新
+# ============================================================
+REPO_URL="https://github.com/dowork-shanqiu/ops-scripts.git"
+MIRROR_REPO_URL="https://ghproxy.cn/https://github.com/dowork-shanqiu/ops-scripts.git"
+
+update_scripts() {
+    print_separator
+    echo -e "  ${BOLD}脚本更新${NC}"
+    print_separator
+    echo ""
+
+    # 检查是否通过 git 安装
+    if [ ! -d "${SCRIPT_DIR}/.git" ]; then
+        log_error "当前安装不支持更新（未检测到 Git 仓库）"
+        log_info "请使用以下命令重新安装："
+        echo ""
+        echo "  curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash"
+        echo ""
+        press_any_key
+        return
+    fi
+
+    # 检查 git 命令
+    if ! command -v git &>/dev/null; then
+        log_error "未找到 git 命令，无法更新"
+        press_any_key
+        return
+    fi
+
+    if ! confirm "是否更新脚本到最新版本?"; then
+        return
+    fi
+
+    echo ""
+    log_info "检测网络环境..."
+    local origin_url="$REPO_URL"
+    if is_china_network; then
+        log_info "检测到中国大陆网络，使用镜像加速"
+        origin_url="$MIRROR_REPO_URL"
+    fi
+
+    log_info "正在更新..."
+    cd "$SCRIPT_DIR"
+    git remote set-url origin "$origin_url"
+    if git fetch origin main && git reset --hard origin/main; then
+        echo ""
+        log_info "✓ 脚本更新完成！"
+        log_info "部分更新可能需要重新运行脚本才能生效"
+    else
+        echo ""
+        log_error "更新失败，请检查网络连接"
+    fi
+
+    press_any_key
+}
+
+# ============================================================
 # 主功能菜单
 # ============================================================
 show_menu() {
@@ -128,10 +185,12 @@ show_menu() {
         echo "    9) 🌐 Nginx 管理 (源码编译)"
         echo "   10) 🔑 Sudoer 管理"
         echo ""
+        echo "   11) 🔄 脚本更新"
+        echo ""
         echo "    0) 退出"
         echo ""
         print_separator
-        select_option "请选择功能" 10 0
+        select_option "请选择功能" 11 0
 
         case "$SELECTED_OPTION" in
             1)
@@ -173,6 +232,9 @@ show_menu() {
             10)
                 source "${MODULES_DIR}/sudoer_mgmt.sh"
                 run_sudoer_mgmt
+                ;;
+            11)
+                update_scripts
                 ;;
             0)
                 echo ""
