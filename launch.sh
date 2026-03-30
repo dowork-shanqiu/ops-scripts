@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-# ---------- 获取脚本所在目录 ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ---------- 获取脚本所在目录（解析软链接，确保通过 /usr/bin/ops-scripts 调用时路径正确）----------
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 MODULES_DIR="${SCRIPT_DIR}/modules"
 
 # ---------- 加载公共模块 ----------
