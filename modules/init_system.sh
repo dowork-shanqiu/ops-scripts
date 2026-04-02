@@ -116,19 +116,12 @@ install_base_packages() {
         # 网络工具
         net-tools
         iproute2
-        dnsutils
         nftables
-
-        # 系统监控
-        htop
-        lsof
 
         # 编译与开发
         build-essential
         apt-transport-https
         ca-certificates
-        gnupg
-        lsb-release
 
         # 安全工具
         fail2ban
@@ -137,7 +130,6 @@ install_base_packages() {
         tmux
         cron
         logrotate
-        bash-completion
         sudo
     )
 
