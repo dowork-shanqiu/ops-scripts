@@ -1101,11 +1101,11 @@ fw_quick_blacklist() {
 
     local nft_ok=false f2b_ok=false
 
-    case "$SELECTED_OPTION" in
-        1|3)
-            local conf_file="${NFTABLES_DIR}/ip_blacklist.conf"
-            if [ ! -f "$conf_file" ]; then
-                cat > "$conf_file" << 'NFTEOF'
+    # 提取 nftables 和 fail2ban 操作的内联函数
+    _do_nft_blacklist() {
+        local conf_file="${NFTABLES_DIR}/ip_blacklist.conf"
+        if [ ! -f "$conf_file" ]; then
+            cat > "$conf_file" << 'NFTEOF'
 #!/usr/sbin/nft -f
 # IP 黑名单规则
 table inet ip_blacklist {
@@ -1114,38 +1114,44 @@ table inet ip_blacklist {
     }
 }
 NFTEOF
-            fi
-            sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
+        fi
+        sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
         ip saddr ${ip} drop  # blacklist $(date '+%Y-%m-%d %H:%M')
 }" "$conf_file"
-            if _fw_validate_and_reload; then
-                log_info "nftables 已封禁: ${ip}"
-                nft_ok=true
-            else
-                log_error "nftables 封禁失败，正在回滚..."
-                sed -i "\|ip saddr ${ip} drop.*blacklist|d" "$conf_file"
-            fi
-            ;;&
-        2|3)
-            if command -v fail2ban-client &>/dev/null && systemctl is-active fail2ban &>/dev/null; then
-                local jails
-                jails=$(_f2b_get_jail_list)
-                if [ -n "$jails" ]; then
-                    local first_jail
-                    first_jail=$(echo "$jails" | head -1)
-                    if fail2ban-client set "$first_jail" banip "$ip" 2>/dev/null; then
-                        log_info "fail2ban 已封禁: ${ip} (Jail: ${first_jail})"
-                        f2b_ok=true
-                    else
-                        log_warn "fail2ban 封禁失败 (CIDR 网段可能不支持)"
-                    fi
+        if _fw_validate_and_reload; then
+            log_info "nftables 已封禁: ${ip}"
+            nft_ok=true
+        else
+            log_error "nftables 封禁失败，正在回滚..."
+            sed -i "\|ip saddr ${ip} drop.*blacklist|d" "$conf_file"
+        fi
+    }
+
+    _do_f2b_blacklist() {
+        if command -v fail2ban-client &>/dev/null && systemctl is-active fail2ban &>/dev/null; then
+            local jails
+            jails=$(_f2b_get_jail_list)
+            if [ -n "$jails" ]; then
+                local first_jail
+                first_jail=$(echo "$jails" | head -1)
+                if fail2ban-client set "$first_jail" banip "$ip" 2>/dev/null; then
+                    log_info "fail2ban 已封禁: ${ip} (Jail: ${first_jail})"
+                    f2b_ok=true
                 else
-                    log_warn "fail2ban 没有活跃的 Jail，跳过"
+                    log_warn "fail2ban 封禁失败 (CIDR 网段可能不支持)"
                 fi
             else
-                log_warn "fail2ban 未安装或未运行，跳过 fail2ban 封禁"
+                log_warn "fail2ban 没有活跃的 Jail，跳过"
             fi
-            ;;
+        else
+            log_warn "fail2ban 未安装或未运行，跳过 fail2ban 封禁"
+        fi
+    }
+
+    case "$SELECTED_OPTION" in
+        1) _do_nft_blacklist ;;
+        2) _do_f2b_blacklist ;;
+        3) _do_nft_blacklist; _do_f2b_blacklist ;;
     esac
 
     echo ""
@@ -1181,9 +1187,7 @@ _rebuild_temp_whitelist_conf() {
                 [[ "$ip" =~ ^# ]] && continue
                 if [ "$expiry" -gt "$now" ]; then
                     local expire_str
-                    expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-                        || date -r "$expiry" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-                        || echo "unknown")
+                    expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
                     if [[ "$ip" == *:* ]]; then
                         echo "        ip6 saddr ${ip} accept  # temp_whitelist expires ${expire_str}"
                     else

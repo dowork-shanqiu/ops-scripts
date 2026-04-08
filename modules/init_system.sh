@@ -157,7 +157,7 @@ setup_timezone() {
     log_step "时区设置"
     echo ""
 
-    log_info "当前时区: $(timedatectl 2>/dev/null | grep 'Time zone' | awk '{print $3}')"
+    log_info "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || timedatectl 2>/dev/null | grep 'Time zone' | awk '{print $3}')"
     log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo ""
 
