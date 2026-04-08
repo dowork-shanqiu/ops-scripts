@@ -346,8 +346,8 @@ configure_mirror_interactive() {
                 echo ""
                 local new_url
                 read_nonempty "请输入镜像地址 (如: https://gh-proxy.example.com)" new_url
-                if ! echo "$new_url" | grep -qE '^https?://'; then
-                    log_error "地址格式不正确，请以 http:// 或 https:// 开头"
+                if ! echo "$new_url" | grep -qE '^https?://[a-zA-Z0-9]'; then
+                    log_error "地址格式不正确，请以 http:// 或 https:// 开头并包含有效域名"
                     press_any_key
                     continue
                 fi

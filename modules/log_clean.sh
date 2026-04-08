@@ -567,9 +567,9 @@ logrotate_add_config() {
 
     local conf_name
     read_nonempty "请输入配置名称 (将保存为 /etc/logrotate.d/<名称>)" conf_name
-    # Sanitize name: only allow alphanumeric, dash, underscore
-    if ! echo "$conf_name" | grep -qE '^[a-zA-Z0-9_-]+$'; then
-        log_error "名称只能包含字母、数字、连字符和下划线"
+    # Sanitize name: must start with alphanumeric, only allow alphanumeric, dash, underscore
+    if ! echo "$conf_name" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]*$'; then
+        log_error "名称必须以字母或数字开头，且只能包含字母、数字、连字符和下划线"
         return 1
     fi
 
@@ -655,7 +655,7 @@ logrotate_add_config() {
     log_info "✓ 轮转配置已写入: ${conf_path}"
     echo ""
     log_step "配置内容预览:"
-    cat "$conf_path" | awk '{print "  " $0}'
+    awk '{print "  " $0}' "$conf_path"
     echo ""
 
     if confirm "是否立即测试此配置 (dry-run)?"; then

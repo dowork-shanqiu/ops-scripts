@@ -227,8 +227,8 @@ configure_install_mirror() {
             log_warn "地址不能为空，请重新输入"
             continue
         fi
-        if ! echo "$new_url" | grep -qE '^https?://'; then
-            log_warn "地址格式不正确，请以 http:// 或 https:// 开头"
+        if ! echo "$new_url" | grep -qE '^https?://[a-zA-Z0-9]'; then
+            log_warn "地址格式不正确，请以 http:// 或 https:// 开头并包含有效域名"
             continue
         fi
         MIRROR_URL="${new_url%/}"
