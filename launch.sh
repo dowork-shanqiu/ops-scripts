@@ -22,6 +22,9 @@ MODULES_DIR="${SCRIPT_DIR}/modules"
 # ---------- 加载公共模块 ----------
 source "${MODULES_DIR}/common.sh"
 
+# ---------- 加载镜像配置 ----------
+load_mirror_config
+
 # ============================================================
 # 前置检查
 # ============================================================
@@ -95,7 +98,7 @@ run_initialization() {
 GITHUB_REPO="dowork-shanqiu/ops-scripts"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 VERSION_FILE="${SCRIPT_DIR}/.version"
-MIRROR_PREFIX="https://ghproxy.cn/"
+AUTO_MIRROR_PREFIX="https://ghproxy.cn/"
 
 update_scripts() {
     print_separator
@@ -113,17 +116,33 @@ update_scripts() {
     fi
 
     echo ""
-    log_info "检测网络环境..."
-    local use_mirror=false
-    if is_china_network; then
-        log_info "检测到中国大陆网络，使用镜像加速"
-        use_mirror=true
+
+    # 确定使用的下载前缀
+    local mirror_prefix=""
+    if [ -n "${MIRROR_URL:-}" ]; then
+        log_info "使用已配置的镜像代理: ${MIRROR_URL}"
+        mirror_prefix="${MIRROR_URL%/}/"
+    else
+        log_info "检测网络环境..."
+        if is_china_network; then
+            log_info "检测到中国大陆网络，使用默认镜像加速"
+            mirror_prefix="${AUTO_MIRROR_PREFIX}"
+        fi
+    fi
+
+    # 构建 API 地址
+    local api_url
+    if [ -n "$mirror_prefix" ]; then
+        api_url="${mirror_prefix}${GITHUB_API}"
+    else
+        api_url="$GITHUB_API"
     fi
 
     # 获取最新版本
     log_info "获取最新版本信息..."
     local latest_tag
-    latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API" 2>/dev/null \
+    latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+        "${MIRROR_CURL_ARGS[@]+"${MIRROR_CURL_ARGS[@]}"}" "$api_url" 2>/dev/null \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$latest_tag" ]; then
@@ -136,7 +155,7 @@ update_scripts() {
 
     # 检查是否已是最新版本
     if [ -f "$VERSION_FILE" ]; then
-        if [ "$current_version" = "$latest_tag" ]; then
+        if [ "${current_version:-}" = "$latest_tag" ]; then
             echo ""
             log_info "当前已是最新版本，无需更新"
             press_any_key
@@ -151,8 +170,8 @@ update_scripts() {
 
     echo ""
     local tarball_url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${latest_tag}.tar.gz"
-    if [ "$use_mirror" = true ]; then
-        tarball_url="${MIRROR_PREFIX}${tarball_url}"
+    if [ -n "$mirror_prefix" ]; then
+        tarball_url="${mirror_prefix}${tarball_url}"
     fi
 
     local tmp_dir
@@ -160,7 +179,8 @@ update_scripts() {
     local tmp_file="${tmp_dir}/ops-scripts.tar.gz"
 
     log_info "正在下载版本 ${latest_tag}..."
-    if ! curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp_file" "$tarball_url"; then
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 \
+        "${MIRROR_CURL_ARGS[@]+"${MIRROR_CURL_ARGS[@]}"}" -o "$tmp_file" "$tarball_url"; then
         rm -rf "$tmp_dir"
         log_error "下载失败，请检查网络连接"
         press_any_key
@@ -216,6 +236,9 @@ show_menu() {
         echo "  ============================================================"
         echo -e "${NC}"
         echo -e "  ${BOLD}服务器运维工具集${NC}  |  系统: ${OS_NAME}"
+        if [ -n "${MIRROR_URL:-}" ]; then
+            echo -e "  ${YELLOW}镜像代理: ${MIRROR_URL}${NC}"
+        fi
         echo ""
         print_separator
         echo ""
@@ -231,17 +254,19 @@ show_menu() {
         echo "    8) 🌐 Caddy 管理"
         echo "    9) 🌐 Nginx 管理 (源码编译)"
         echo "   10) 🔑 Sudoer 管理"
-        echo "   11) 🗂️  日志空间清理"
+        echo "   11) 📋 日志管理"
         echo ""
         echo "   12) 🔄 脚本更新"
+        echo "   13) 🌐 镜像代理配置"
         echo ""
         echo "    0) 退出"
         echo ""
         print_separator
-        select_option "请选择功能" 12 0
+        select_option "请选择功能" 13 0
 
         case "$SELECTED_OPTION" in
             1)
+                check_and_install_deps "防火墙管理" "nft:nftables" || continue
                 source "${MODULES_DIR}/firewall.sh"
                 run_firewall
                 ;;
@@ -258,6 +283,7 @@ show_menu() {
                 run_system_info
                 ;;
             5)
+                check_and_install_deps "定时任务管理" "crontab:cron" || continue
                 source "${MODULES_DIR}/cron_mgmt.sh"
                 run_cron_mgmt
                 ;;
@@ -283,10 +309,13 @@ show_menu() {
                 ;;
             11)
                 source "${MODULES_DIR}/log_clean.sh"
-                run_log_clean
+                run_log_mgmt
                 ;;
             12)
                 update_scripts
+                ;;
+            13)
+                configure_mirror_interactive
                 ;;
             0)
                 echo ""

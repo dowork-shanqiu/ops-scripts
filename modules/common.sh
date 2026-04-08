@@ -216,3 +216,212 @@ get_script_dir() {
     dir="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
     echo "$dir"
 }
+
+# ============================================================
+# 镜像代理配置
+# ============================================================
+
+MIRROR_CONF_FILE="/etc/ops-scripts/mirror.conf"
+MIRROR_URL=""
+MIRROR_HEADERS=()
+MIRROR_CURL_ARGS=()
+
+# 加载镜像配置（从文件读取到全局变量）
+load_mirror_config() {
+    MIRROR_URL=""
+    MIRROR_HEADERS=()
+    MIRROR_CURL_ARGS=()
+    [ -f "$MIRROR_CONF_FILE" ] || return 0
+
+    local raw
+    raw=$(grep "^MIRROR_URL=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    MIRROR_URL="${raw:-}"
+
+    local count=0
+    raw=$(grep "^HEADER_COUNT=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    count="${raw:-0}"
+
+    local i=0
+    while [ "$i" -lt "${count}" ]; do
+        raw=$(grep "^HEADER_${i}=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+        if [ -n "${raw:-}" ]; then
+            MIRROR_HEADERS+=("$raw")
+            MIRROR_CURL_ARGS+=(-H "$raw")
+        fi
+        (( i++ )) || true
+    done
+}
+
+# 保存镜像配置到文件
+save_mirror_config() {
+    ensure_marker_dir
+    {
+        printf 'MIRROR_URL=%s\n' "${MIRROR_URL}"
+        printf 'HEADER_COUNT=%d\n' "${#MIRROR_HEADERS[@]}"
+        local i=0
+        for h in "${MIRROR_HEADERS[@]+"${MIRROR_HEADERS[@]}"}"; do
+            printf 'HEADER_%d=%s\n' "$i" "$h"
+            (( i++ )) || true
+        done
+    } > "$MIRROR_CONF_FILE"
+}
+
+# 构建带镜像前缀的完整 URL
+build_mirror_url() {
+    local url="$1"
+    if [ -n "${MIRROR_URL:-}" ]; then
+        echo "${MIRROR_URL%/}/${url}"
+    else
+        echo "$url"
+    fi
+}
+
+# 显示当前镜像配置状态
+show_mirror_status() {
+    if [ -z "${MIRROR_URL:-}" ]; then
+        log_info "当前未配置镜像代理"
+    else
+        log_info "镜像地址: ${MIRROR_URL}"
+        if [ ${#MIRROR_HEADERS[@]} -eq 0 ]; then
+            log_info "认证请求头: 未配置"
+        else
+            log_info "认证请求头 (共 ${#MIRROR_HEADERS[@]} 个):"
+            for h in "${MIRROR_HEADERS[@]}"; do
+                local hname="${h%%:*}"
+                echo "    ${hname}: ****"
+            done
+        fi
+    fi
+}
+
+# 内部函数：交互配置认证请求头
+_configure_mirror_headers() {
+    MIRROR_HEADERS=()
+    MIRROR_CURL_ARGS=()
+    echo ""
+    log_info "配置认证请求头 (可配置多个，输入空行结束)"
+    log_info "格式示例: X-XN-Token: xxxxxx"
+    echo ""
+    local idx=0
+    while true; do
+        local h
+        read -r -p "$(echo -e "${CYAN}  第 $((idx + 1)) 个请求头 (直接回车结束): ${NC}")" h
+        if [ -z "$h" ]; then
+            break
+        fi
+        if ! echo "$h" | grep -q ": "; then
+            log_warn "格式不正确，请使用 'Header-Name: value' 格式"
+            continue
+        fi
+        MIRROR_HEADERS+=("$h")
+        MIRROR_CURL_ARGS+=(-H "$h")
+        local hname="${h%%:*}"
+        log_info "  ✓ 已添加: ${hname}: ****"
+        (( idx++ )) || true
+    done
+    if [ ${#MIRROR_HEADERS[@]} -gt 0 ]; then
+        log_info "共添加 ${#MIRROR_HEADERS[@]} 个认证请求头"
+    else
+        log_info "未配置认证请求头"
+    fi
+}
+
+# 交互配置/管理镜像代理（供菜单调用）
+configure_mirror_interactive() {
+    while true; do
+        print_separator
+        echo -e "  ${BOLD}镜像代理配置${NC}"
+        print_separator
+        echo ""
+        show_mirror_status
+        echo ""
+        echo "  1) 配置/重新配置镜像代理"
+        echo "  2) 清除镜像代理配置"
+        echo "  0) 返回"
+        echo ""
+        select_option "请选择" 2 0
+
+        case "$SELECTED_OPTION" in
+            1)
+                echo ""
+                local new_url
+                read_nonempty "请输入镜像地址 (如: https://gh-proxy.example.com)" new_url
+                if ! echo "$new_url" | grep -qE '^https?://[a-zA-Z0-9]'; then
+                    log_error "地址格式不正确，请以 http:// 或 https:// 开头并包含有效域名"
+                    press_any_key
+                    continue
+                fi
+                MIRROR_URL="${new_url%/}"
+                echo ""
+                if confirm "是否配置认证请求头?"; then
+                    _configure_mirror_headers
+                else
+                    MIRROR_HEADERS=()
+                    MIRROR_CURL_ARGS=()
+                fi
+                save_mirror_config
+                echo ""
+                log_info "✓ 镜像代理配置已保存"
+                show_mirror_status
+                press_any_key
+                ;;
+            2)
+                if confirm "确认清除镜像代理配置?"; then
+                    MIRROR_URL=""
+                    MIRROR_HEADERS=()
+                    MIRROR_CURL_ARGS=()
+                    rm -f "$MIRROR_CONF_FILE"
+                    log_info "✓ 镜像代理配置已清除"
+                fi
+                press_any_key
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+# ============================================================
+# 依赖检查与安装
+# ============================================================
+
+# 检查并提示安装缺失依赖
+# 用法: check_and_install_deps "功能名称" "cmd1:pkg1" "cmd2:pkg2" ...
+# 返回 0 表示所有依赖已满足，1 表示用户拒绝安装或安装失败
+check_and_install_deps() {
+    local feature="$1"
+    shift
+    local missing_pkgs=()
+    local missing_descs=()
+
+    for dep in "$@"; do
+        local cmd="${dep%%:*}"
+        local pkg="${dep#*:}"
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_pkgs+=("$pkg")
+            missing_descs+=("$cmd (软件包: $pkg)")
+        fi
+    done
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo ""
+    log_warn "「${feature}」需要以下依赖，当前尚未安装:"
+    for desc in "${missing_descs[@]}"; do
+        echo "  - ${desc}"
+    done
+    echo ""
+
+    if confirm "是否立即安装所需依赖?"; then
+        log_info "正在安装依赖..."
+        apt update -qq && apt install -y "${missing_pkgs[@]}"
+        echo ""
+        log_info "✓ 依赖安装完成"
+        return 0
+    else
+        log_warn "未安装依赖，返回上级菜单"
+        press_any_key
+        return 1
+    fi
+}

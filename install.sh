@@ -15,9 +15,16 @@ GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 INSTALL_DIR="/opt/ops-scripts"
 BIN_LINK="/usr/bin/ops-scripts"
 VERSION_FILE="${INSTALL_DIR}/.version"
+MARKER_DIR="/etc/ops-scripts"
+MIRROR_CONF_FILE="${MARKER_DIR}/mirror.conf"
 
-# 中国大陆使用 GitHub 镜像
-MIRROR_PREFIX="https://ghproxy.cn/"
+# 中国大陆自动使用 GitHub 镜像
+AUTO_MIRROR_PREFIX="https://ghproxy.cn/"
+
+# 镜像配置（安装过程中填充）
+MIRROR_URL=""
+MIRROR_HEADERS=()
+MIRROR_CURL_ARGS=()
 
 # ---------- 颜色定义 ----------
 RED='\033[0;31m'
@@ -83,10 +90,185 @@ check_dependencies() {
     fi
 }
 
+# ---------- 镜像配置：从文件加载 ----------
+_load_mirror_config() {
+    MIRROR_URL=""
+    MIRROR_HEADERS=()
+    MIRROR_CURL_ARGS=()
+    [ -f "$MIRROR_CONF_FILE" ] || return 0
+
+    local raw
+    raw=$(grep "^MIRROR_URL=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    MIRROR_URL="${raw:-}"
+
+    local count=0
+    raw=$(grep "^HEADER_COUNT=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    count="${raw:-0}"
+
+    local i=0
+    while [ "$i" -lt "${count}" ]; do
+        raw=$(grep "^HEADER_${i}=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+        if [ -n "${raw:-}" ]; then
+            MIRROR_HEADERS+=("$raw")
+            MIRROR_CURL_ARGS+=(-H "$raw")
+        fi
+        (( i++ )) || true
+    done
+}
+
+# ---------- 镜像配置：保存到文件 ----------
+_save_mirror_config() {
+    mkdir -p "$MARKER_DIR"
+    {
+        printf 'MIRROR_URL=%s\n' "${MIRROR_URL}"
+        printf 'HEADER_COUNT=%d\n' "${#MIRROR_HEADERS[@]}"
+        local i=0
+        for h in "${MIRROR_HEADERS[@]+"${MIRROR_HEADERS[@]}"}"; do
+            printf 'HEADER_%d=%s\n' "$i" "$h"
+            (( i++ )) || true
+        done
+    } > "$MIRROR_CONF_FILE"
+}
+
+# ---------- 显示当前镜像状态 ----------
+_show_mirror_status() {
+    if [ -z "${MIRROR_URL:-}" ]; then
+        log_info "当前未配置镜像代理"
+    else
+        log_info "镜像地址: ${MIRROR_URL}"
+        if [ ${#MIRROR_HEADERS[@]} -eq 0 ]; then
+            log_info "认证请求头: 未配置"
+        else
+            log_info "认证请求头: 共 ${#MIRROR_HEADERS[@]} 个"
+            for h in "${MIRROR_HEADERS[@]}"; do
+                local hname="${h%%:*}"
+                echo "    ${hname}: ****"
+            done
+        fi
+    fi
+}
+
+# ---------- 镜像配置：交互配置认证请求头 ----------
+_configure_install_headers() {
+    MIRROR_HEADERS=()
+    MIRROR_CURL_ARGS=()
+    echo ""
+    log_info "配置认证请求头 (可配置多个，直接回车结束)"
+    log_info "格式示例: X-XN-Token: xxxxxx"
+    echo ""
+    local idx=0
+    while true; do
+        local h
+        read -r -p "$(echo -e "${CYAN}  第 $((idx + 1)) 个请求头 (直接回车结束): ${NC}")" h || true
+        if [ -z "$h" ]; then
+            break
+        fi
+        if ! echo "$h" | grep -q ": "; then
+            echo -e "${YELLOW}[WARN]${NC} 格式不正确，请使用 'Header-Name: value' 格式"
+            continue
+        fi
+        MIRROR_HEADERS+=("$h")
+        MIRROR_CURL_ARGS+=(-H "$h")
+        local hname="${h%%:*}"
+        log_info "  ✓ 已添加: ${hname}: ****"
+        (( idx++ )) || true
+    done
+    if [ ${#MIRROR_HEADERS[@]} -gt 0 ]; then
+        log_info "共添加 ${#MIRROR_HEADERS[@]} 个认证请求头"
+    else
+        log_info "未配置认证请求头"
+    fi
+}
+
+# ---------- 镜像配置：交互配置入口 ----------
+configure_install_mirror() {
+    echo ""
+    echo -e "${CYAN}============================================================${NC}"
+    echo -e "  ${BOLD}镜像代理配置${NC}"
+    echo -e "${CYAN}============================================================${NC}"
+    echo ""
+
+    # 加载已有配置
+    _load_mirror_config
+
+    if [ -n "${MIRROR_URL:-}" ]; then
+        log_info "检测到已有镜像配置:"
+        _show_mirror_status
+        echo ""
+        read -r -p "$(echo -e "${YELLOW}是否重新配置镜像? [y/n]: ${NC}")" yn
+        case "$yn" in
+            [Yy]|[Yy][Ee][Ss]) ;;  # continue to configure
+            *)
+                log_info "保留现有镜像配置"
+                return 0
+                ;;
+        esac
+        echo ""
+    fi
+
+    read -r -p "$(echo -e "${YELLOW}是否配置 GitHub 镜像代理? (建议在 GitHub 访问困难时配置) [y/n]: ${NC}")" yn
+    case "$yn" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *)
+            MIRROR_URL=""
+            MIRROR_HEADERS=()
+            MIRROR_CURL_ARGS=()
+            # Clear any existing config if user says no
+            rm -f "$MIRROR_CONF_FILE"
+            log_info "跳过镜像配置"
+            return 0
+            ;;
+    esac
+
+    echo ""
+    while true; do
+        read -r -p "$(echo -e "${CYAN}请输入镜像地址 (如: https://gh-proxy.example.com): ${NC}")" new_url
+        if [ -z "$new_url" ]; then
+            log_warn "地址不能为空，请重新输入"
+            continue
+        fi
+        if ! echo "$new_url" | grep -qE '^https?://[a-zA-Z0-9]'; then
+            log_warn "地址格式不正确，请以 http:// 或 https:// 开头并包含有效域名"
+            continue
+        fi
+        MIRROR_URL="${new_url%/}"
+        break
+    done
+
+    log_info "镜像地址已设置: ${MIRROR_URL}"
+    echo ""
+
+    read -r -p "$(echo -e "${YELLOW}是否配置认证请求头? [y/n]: ${NC}")" yn
+    case "$yn" in
+        [Yy]|[Yy][Ee][Ss])
+            _configure_install_headers
+            ;;
+        *)
+            MIRROR_HEADERS=()
+            MIRROR_CURL_ARGS=()
+            log_info "未配置认证请求头"
+            ;;
+    esac
+
+    # 保存配置
+    mkdir -p "$MARKER_DIR"
+    _save_mirror_config
+    echo ""
+    log_info "✓ 镜像代理配置已保存"
+    _show_mirror_status
+}
+
 # ---------- 获取最新版本标签 ----------
 get_latest_tag() {
+    local mirror_prefix="${1:-}"
+    local api_url="$GITHUB_API"
+    if [ -n "$mirror_prefix" ]; then
+        api_url="${mirror_prefix}${GITHUB_API}"
+    fi
+
     local tag
-    tag=$(curl -fsSL --connect-timeout 10 --max-time 15 "$GITHUB_API" 2>/dev/null \
+    tag=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+        "${MIRROR_CURL_ARGS[@]+"${MIRROR_CURL_ARGS[@]}"}" "$api_url" 2>/dev/null \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     if [ -z "$tag" ]; then
         return 1
@@ -97,11 +279,11 @@ get_latest_tag() {
 # ---------- 下载并安装指定标签版本 ----------
 download_and_install() {
     local tag="$1"
-    local use_mirror="$2"
+    local mirror_prefix="${2:-}"
 
     local tarball_url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${tag}.tar.gz"
-    if [ "$use_mirror" = true ]; then
-        tarball_url="${MIRROR_PREFIX}${tarball_url}"
+    if [ -n "$mirror_prefix" ]; then
+        tarball_url="${mirror_prefix}${tarball_url}"
     fi
 
     local tmp_dir
@@ -109,7 +291,8 @@ download_and_install() {
     local tmp_file="${tmp_dir}/ops-scripts.tar.gz"
 
     log_info "正在下载版本 ${tag}..."
-    if ! curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp_file" "$tarball_url"; then
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 \
+        "${MIRROR_CURL_ARGS[@]+"${MIRROR_CURL_ARGS[@]}"}" -o "$tmp_file" "$tarball_url"; then
         rm -rf "$tmp_dir"
         log_error "下载失败，请检查网络连接后重试"
         return 1
@@ -168,19 +351,26 @@ main() {
     # 检查依赖
     check_dependencies
 
-    # 检测网络环境
-    local use_mirror=false
+    # 交互配置镜像代理
+    configure_install_mirror
 
-    log_info "检测网络环境..."
-    if is_china_network; then
-        log_info "检测到中国大陆网络，使用镜像加速"
-        use_mirror=true
+    # 确定下载前缀
+    local mirror_prefix=""
+    if [ -n "${MIRROR_URL:-}" ]; then
+        mirror_prefix="${MIRROR_URL%/}/"
+    else
+        # 未配置自定义镜像则自动检测网络环境
+        log_info "检测网络环境..."
+        if is_china_network; then
+            log_info "检测到中国大陆网络，使用默认镜像加速"
+            mirror_prefix="${AUTO_MIRROR_PREFIX}"
+        fi
     fi
 
     # 获取最新版本
     log_info "获取最新版本信息..."
     local latest_tag
-    if ! latest_tag=$(get_latest_tag); then
+    if ! latest_tag=$(get_latest_tag "$mirror_prefix"); then
         log_error "无法获取最新版本信息，请检查网络连接"
         exit 1
     fi
@@ -200,7 +390,7 @@ main() {
     fi
 
     # 下载并安装
-    if ! download_and_install "$latest_tag" "$use_mirror"; then
+    if ! download_and_install "$latest_tag" "$mirror_prefix"; then
         exit 1
     fi
 
