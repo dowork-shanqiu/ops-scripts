@@ -152,6 +152,56 @@ install_base_packages() {
     fi
 }
 
+# ---------- 时区设置 ----------
+setup_timezone() {
+    log_step "时区设置"
+    echo ""
+
+    log_info "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || timedatectl 2>/dev/null | grep 'Time zone' | awk '{print $3}')"
+    log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo ""
+
+    if ! confirm "是否设置系统时区?"; then
+        log_info "跳过时区设置，保持当前时区"
+        return 0
+    fi
+
+    echo ""
+    echo "常用时区:"
+    echo "  1) Asia/Shanghai    (中国-上海)"
+    echo "  2) Asia/Hong_Kong   (中国-香港)"
+    echo "  3) Asia/Tokyo       (日本-东京)"
+    echo "  4) Asia/Singapore   (新加坡)"
+    echo "  5) America/New_York (美东)"
+    echo "  6) America/Los_Angeles (美西)"
+    echo "  7) Europe/London    (英国-伦敦)"
+    echo "  8) Europe/Berlin    (德国-柏林)"
+    echo "  9) UTC"
+    echo " 10) 手动输入"
+    select_option "请选择" 10
+
+    local tz=""
+    case "$SELECTED_OPTION" in
+        1)  tz="Asia/Shanghai" ;;
+        2)  tz="Asia/Hong_Kong" ;;
+        3)  tz="Asia/Tokyo" ;;
+        4)  tz="Asia/Singapore" ;;
+        5)  tz="America/New_York" ;;
+        6)  tz="America/Los_Angeles" ;;
+        7)  tz="Europe/London" ;;
+        8)  tz="Europe/Berlin" ;;
+        9)  tz="UTC" ;;
+        10) read_nonempty "请输入时区 (如: Asia/Shanghai)" tz ;;
+    esac
+
+    if timedatectl set-timezone "$tz" 2>/dev/null; then
+        log_info "✓ 时区已设置为: ${tz}"
+        log_info "  当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    else
+        log_error "时区设置失败，请确认时区名称是否正确"
+    fi
+}
+
 # ---------- 入口函数 ----------
 run_init_system() {
     print_separator
@@ -164,6 +214,8 @@ run_init_system() {
     update_system
     echo ""
     install_base_packages
+    echo ""
+    setup_timezone
     echo ""
 
     log_info "系统环境配置完成"
