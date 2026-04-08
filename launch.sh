@@ -231,13 +231,14 @@ show_menu() {
         echo "    8) 🌐 Caddy 管理"
         echo "    9) 🌐 Nginx 管理 (源码编译)"
         echo "   10) 🔑 Sudoer 管理"
+        echo "   11) 🗂️  日志空间清理"
         echo ""
-        echo "   11) 🔄 脚本更新"
+        echo "   12) 🔄 脚本更新"
         echo ""
         echo "    0) 退出"
         echo ""
         print_separator
-        select_option "请选择功能" 11 0
+        select_option "请选择功能" 12 0
 
         case "$SELECTED_OPTION" in
             1)
@@ -281,6 +282,10 @@ show_menu() {
                 run_sudoer_mgmt
                 ;;
             11)
+                source "${MODULES_DIR}/log_clean.sh"
+                run_log_clean
+                ;;
+            12)
                 update_scripts
                 ;;
             0)
