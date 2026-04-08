@@ -356,7 +356,7 @@ log_clean_custom() {
 }
 
 # ============================================================
-# 入口函数
+# 日志清理入口函数（作为日志管理的二级菜单）
 # ============================================================
 run_log_clean() {
     while true; do
@@ -382,5 +382,383 @@ run_log_clean() {
             0) return 0 ;;
         esac
         press_any_key
+    done
+}
+
+# ============================================================
+# 日志轮转管理
+# ============================================================
+
+# ---------- 查看轮转状态 ----------
+logrotate_show_status() {
+    print_separator
+    echo -e "${BOLD}  日志轮转状态${NC}"
+    print_separator
+    echo ""
+
+    log_step "logrotate 主配置文件 (/etc/logrotate.conf):"
+    if [ -f /etc/logrotate.conf ]; then
+        grep -v '^#' /etc/logrotate.conf | grep -v '^$' | head -20 | awk '{print "  " $0}'
+    else
+        log_warn "未找到 /etc/logrotate.conf"
+    fi
+    echo ""
+
+    log_step "/etc/logrotate.d/ 中的服务配置 (共 $(ls /etc/logrotate.d/ 2>/dev/null | wc -l) 个):"
+    print_thin_separator
+    if [ -d /etc/logrotate.d ]; then
+        ls -1 /etc/logrotate.d/ 2>/dev/null | awk '{print "  " $0}'
+    fi
+    print_thin_separator
+    echo ""
+
+    log_step "上次轮转记录 (/var/lib/logrotate/status):"
+    if [ -f /var/lib/logrotate/status ]; then
+        local total
+        total=$(wc -l < /var/lib/logrotate/status)
+        echo "  (共 $((total - 1)) 条记录，显示最近 20 条)"
+        print_thin_separator
+        tail -20 /var/lib/logrotate/status | awk '{print "  " $0}'
+    else
+        log_warn "状态文件不存在: /var/lib/logrotate/status"
+    fi
+    echo ""
+}
+
+# ---------- 立即执行日志轮转 ----------
+logrotate_run_now() {
+    while true; do
+        print_separator
+        echo -e "${BOLD}  立即执行日志轮转${NC}"
+        print_separator
+        echo ""
+        echo "  1) 执行所有轮转规则 (按时间条件)"
+        echo "  2) 强制执行所有轮转规则 (忽略时间条件)"
+        echo "  3) 对指定配置文件执行轮转"
+        echo "  4) 模拟运行 (不实际执行，仅查看效果)"
+        echo "  0) 返回"
+        echo ""
+        select_option "请选择" 4 0
+
+        case "$SELECTED_OPTION" in
+            1)
+                if confirm "确认执行所有日志轮转?"; then
+                    log_info "正在执行日志轮转..."
+                    logrotate /etc/logrotate.conf 2>&1 | awk '{print "  " $0}'
+                    echo ""
+                    log_info "✓ 日志轮转执行完成"
+                fi
+                ;;
+            2)
+                log_warn "强制执行将忽略时间条件，对所有日志立即进行轮转"
+                if confirm "确认强制执行所有日志轮转?"; then
+                    log_info "正在强制执行日志轮转..."
+                    logrotate -f /etc/logrotate.conf 2>&1 | awk '{print "  " $0}'
+                    echo ""
+                    log_info "✓ 强制日志轮转执行完成"
+                fi
+                ;;
+            3)
+                echo ""
+                echo "  可用配置文件:"
+                ls -1 /etc/logrotate.d/ 2>/dev/null | nl -ba | awk '{print "  " $0}'
+                echo ""
+                local conf_name
+                read_nonempty "请输入配置文件名称 (位于 /etc/logrotate.d/)" conf_name
+                local conf_path="/etc/logrotate.d/${conf_name}"
+                if [ ! -f "$conf_path" ]; then
+                    log_error "配置文件不存在: ${conf_path}"
+                else
+                    echo ""
+                    echo "  1) 正常执行"
+                    echo "  2) 强制执行"
+                    select_option "请选择" 2
+                    if [ "$SELECTED_OPTION" -eq 1 ]; then
+                        logrotate "$conf_path" 2>&1 | awk '{print "  " $0}'
+                    else
+                        logrotate -f "$conf_path" 2>&1 | awk '{print "  " $0}'
+                    fi
+                    echo ""
+                    log_info "✓ 执行完成"
+                fi
+                ;;
+            4)
+                log_info "模拟运行所有轮转规则 (dry-run):"
+                echo ""
+                logrotate -d /etc/logrotate.conf 2>&1 | awk '{print "  " $0}'
+                ;;
+            0) return 0 ;;
+        esac
+        press_any_key
+    done
+}
+
+# ---------- 查看轮转配置文件内容 ----------
+logrotate_view_config() {
+    while true; do
+        print_separator
+        echo -e "${BOLD}  查看轮转配置${NC}"
+        print_separator
+        echo ""
+        echo "  1) 查看主配置 (/etc/logrotate.conf)"
+        echo "  2) 查看 /etc/logrotate.d/ 中的配置文件"
+        echo "  0) 返回"
+        echo ""
+        select_option "请选择" 2 0
+
+        case "$SELECTED_OPTION" in
+            1)
+                print_separator
+                echo -e "${BOLD}  /etc/logrotate.conf${NC}"
+                print_separator
+                echo ""
+                cat /etc/logrotate.conf 2>/dev/null | awk '{print "  " $0}' || log_warn "文件不存在"
+                ;;
+            2)
+                echo ""
+                echo "  /etc/logrotate.d/ 中的配置文件:"
+                print_thin_separator
+                local files=()
+                while IFS= read -r f; do
+                    files+=("$f")
+                done < <(ls -1 /etc/logrotate.d/ 2>/dev/null)
+
+                if [ ${#files[@]} -eq 0 ]; then
+                    log_warn "目录为空"
+                    press_any_key
+                    continue
+                fi
+
+                local idx=1
+                for f in "${files[@]}"; do
+                    printf "  %3d) %s\n" "$idx" "$f"
+                    (( idx++ )) || true
+                done
+                print_thin_separator
+                echo ""
+                local choice
+                read -r -p "$(echo -e "${CYAN}请输入文件序号 [1-${#files[@]}] (回车返回): ${NC}")" choice
+                if [ -z "$choice" ]; then
+                    continue
+                fi
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ]; then
+                    local selected="${files[$((choice - 1))]}"
+                    echo ""
+                    print_thin_separator
+                    echo -e "  ${BOLD}/etc/logrotate.d/${selected}${NC}"
+                    print_thin_separator
+                    cat "/etc/logrotate.d/${selected}" 2>/dev/null | awk '{print "  " $0}'
+                else
+                    log_warn "无效的序号"
+                fi
+                ;;
+            0) return 0 ;;
+        esac
+        press_any_key
+    done
+}
+
+# ---------- 添加自定义轮转配置 ----------
+logrotate_add_config() {
+    print_separator
+    echo -e "${BOLD}  添加自定义日志轮转配置${NC}"
+    print_separator
+    echo ""
+
+    local conf_name
+    read_nonempty "请输入配置名称 (将保存为 /etc/logrotate.d/<名称>)" conf_name
+    # Sanitize name: only allow alphanumeric, dash, underscore
+    if ! echo "$conf_name" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        log_error "名称只能包含字母、数字、连字符和下划线"
+        return 1
+    fi
+
+    local conf_path="/etc/logrotate.d/${conf_name}"
+    if [ -f "$conf_path" ]; then
+        log_warn "配置文件已存在: ${conf_path}"
+        if ! confirm "是否覆盖?"; then
+            return 0
+        fi
+    fi
+
+    echo ""
+    local log_path
+    read_nonempty "请输入要轮转的日志文件路径 (支持通配符，如 /var/log/myapp/*.log)" log_path
+
+    echo ""
+    echo "  轮转周期:"
+    echo "  1) daily   (每天)"
+    echo "  2) weekly  (每周)"
+    echo "  3) monthly (每月)"
+    select_option "请选择" 3
+    local rotate_cycle
+    case "$SELECTED_OPTION" in
+        1) rotate_cycle="daily" ;;
+        2) rotate_cycle="weekly" ;;
+        3) rotate_cycle="monthly" ;;
+    esac
+
+    local rotate_count
+    read_optional "保留轮转文件数量" rotate_count "7"
+    if ! [[ "$rotate_count" =~ ^[0-9]+$ ]] || [ "$rotate_count" -lt 1 ]; then
+        rotate_count=7
+    fi
+
+    echo ""
+    echo "  压缩选项:"
+    echo "  1) 压缩轮转后的日志 (compress)"
+    echo "  2) 不压缩"
+    select_option "请选择" 2
+    local compress_opt=""
+    if [ "$SELECTED_OPTION" -eq 1 ]; then
+        compress_opt="    compress
+    delaycompress"
+    fi
+
+    echo ""
+    echo "  缺失日志处理:"
+    echo "  1) 忽略缺失的日志文件 (missingok)"
+    echo "  2) 日志不存在时报错"
+    select_option "请选择" 2
+    local missingok_opt=""
+    [ "$SELECTED_OPTION" -eq 1 ] && missingok_opt="    missingok"
+
+    echo ""
+    echo "  空文件处理:"
+    echo "  1) 跳过空文件 (notifempty)"
+    echo "  2) 对空文件也执行轮转"
+    select_option "请选择" 2
+    local notifempty_opt=""
+    [ "$SELECTED_OPTION" -eq 1 ] && notifempty_opt="    notifempty"
+
+    echo ""
+    local postrotate_cmd
+    read -r -p "$(echo -e "${CYAN}轮转后执行的命令 (可选，如重载服务，直接回车跳过): ${NC}")" postrotate_cmd
+
+    # Write config file
+    {
+        echo "${log_path} {"
+        echo "    ${rotate_cycle}"
+        echo "    rotate ${rotate_count}"
+        [ -n "$compress_opt" ] && echo "$compress_opt"
+        [ -n "$missingok_opt" ] && echo "$missingok_opt"
+        [ -n "$notifempty_opt" ] && echo "$notifempty_opt"
+        if [ -n "$postrotate_cmd" ]; then
+            echo "    postrotate"
+            echo "        ${postrotate_cmd}"
+            echo "    endscript"
+        fi
+        echo "}"
+    } > "$conf_path"
+
+    echo ""
+    log_info "✓ 轮转配置已写入: ${conf_path}"
+    echo ""
+    log_step "配置内容预览:"
+    cat "$conf_path" | awk '{print "  " $0}'
+    echo ""
+
+    if confirm "是否立即测试此配置 (dry-run)?"; then
+        echo ""
+        logrotate -d "$conf_path" 2>&1 | awk '{print "  " $0}'
+    fi
+}
+
+# ---------- 删除自定义轮转配置 ----------
+logrotate_delete_config() {
+    print_separator
+    echo -e "${BOLD}  删除自定义日志轮转配置${NC}"
+    print_separator
+    echo ""
+
+    local files=()
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(ls -1 /etc/logrotate.d/ 2>/dev/null)
+
+    if [ ${#files[@]} -eq 0 ]; then
+        log_info "没有可删除的配置文件"
+        return 0
+    fi
+
+    echo "  /etc/logrotate.d/ 中的配置文件:"
+    print_thin_separator
+    local idx=1
+    for f in "${files[@]}"; do
+        printf "  %3d) %s\n" "$idx" "$f"
+        (( idx++ )) || true
+    done
+    print_thin_separator
+    echo ""
+
+    local choice
+    read -r -p "$(echo -e "${CYAN}请输入要删除的文件序号 [1-${#files[@]}] (回车取消): ${NC}")" choice
+    if [ -z "$choice" ]; then
+        log_info "已取消"
+        return 0
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ]; then
+        local selected="${files[$((choice - 1))]}"
+        log_warn "即将删除配置文件: /etc/logrotate.d/${selected}"
+        if confirm "确认删除?"; then
+            rm -f "/etc/logrotate.d/${selected}"
+            log_info "✓ 已删除: /etc/logrotate.d/${selected}"
+        fi
+    else
+        log_warn "无效的序号"
+    fi
+}
+
+# ---------- 日志轮转管理入口 ----------
+run_logrotate_mgmt() {
+    # 检查 logrotate 依赖
+    check_and_install_deps "日志轮转管理" "logrotate:logrotate" || return 0
+
+    while true; do
+        print_separator
+        echo -e "${BOLD}  日志轮转管理${NC}"
+        print_separator
+        echo ""
+        echo "  1) 查看轮转状态与配置"
+        echo "  2) 查看轮转配置文件内容"
+        echo "  3) 立即执行日志轮转"
+        echo "  4) 添加自定义轮转配置"
+        echo "  5) 删除自定义轮转配置"
+        echo "  0) 返回上级菜单"
+        echo ""
+        select_option "请选择" 5 0
+
+        case "$SELECTED_OPTION" in
+            1) logrotate_show_status; press_any_key ;;
+            2) logrotate_view_config ;;
+            3) logrotate_run_now ;;
+            4) logrotate_add_config; press_any_key ;;
+            5) logrotate_delete_config; press_any_key ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+# ============================================================
+# 日志管理顶层入口函数
+# ============================================================
+run_log_mgmt() {
+    while true; do
+        print_separator
+        echo -e "${BOLD}  日志管理${NC}"
+        print_separator
+        echo ""
+        echo "  1) 日志空间清理"
+        echo "  2) 日志轮转管理"
+        echo "  0) 返回上级菜单"
+        echo ""
+        select_option "请选择" 2 0
+
+        case "$SELECTED_OPTION" in
+            1) run_log_clean ;;
+            2) run_logrotate_mgmt ;;
+            0) return 0 ;;
+        esac
     done
 }
