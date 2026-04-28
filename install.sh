@@ -4,13 +4,13 @@
 # 通过 curl 一键安装服务器运维脚本集合
 #
 # 用法:
-#   curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/uuuuupdate/ops-scripts/main/install.sh | sudo bash
 # ============================================================
 
 set -euo pipefail
 
 # ---------- 配置 ----------
-GITHUB_REPO="dowork-shanqiu/ops-scripts"
+GITHUB_REPO="uuuuupdate/ops-scripts"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 INSTALL_DIR="/opt/ops-scripts"
 BIN_LINK="/usr/bin/ops-scripts"

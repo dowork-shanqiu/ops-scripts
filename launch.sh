@@ -95,7 +95,7 @@ run_initialization() {
 # ============================================================
 # 脚本更新
 # ============================================================
-GITHUB_REPO="dowork-shanqiu/ops-scripts"
+GITHUB_REPO="uuuuupdate/ops-scripts"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 VERSION_FILE="${SCRIPT_DIR}/.version"
 AUTO_MIRROR_PREFIX="https://ghproxy.cn/"

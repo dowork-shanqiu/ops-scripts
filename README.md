@@ -40,7 +40,7 @@
 通过 `curl` 一键下载并安装到系统中，安装完成后可以直接使用 `ops-scripts` 命令运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/uuuuupdate/ops-scripts/main/install.sh | sudo bash
 ```
 
 安装完成后运行：
@@ -55,8 +55,8 @@ sudo ops-scripts
 
 ```bash
 # 下载最新版本（将 TAG 替换为实际版本号，如 v1.0.0）
-# 可在 https://github.com/dowork-shanqiu/ops-scripts/releases 查看所有可用版本
-curl -fsSL -o ops-scripts.tar.gz https://github.com/dowork-shanqiu/ops-scripts/archive/refs/tags/TAG.tar.gz
+# 可在 https://github.com/uuuuupdate/ops-scripts/releases 查看所有可用版本
+curl -fsSL -o ops-scripts.tar.gz https://github.com/uuuuupdate/ops-scripts/archive/refs/tags/TAG.tar.gz
 
 # 解压并进入目录
 tar -xzf ops-scripts.tar.gz
@@ -78,7 +78,7 @@ sudo bash launch.sh
 **方式二：重新运行安装命令**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dowork-shanqiu/ops-scripts/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/uuuuupdate/ops-scripts/main/install.sh | sudo bash
 ```
 
 安装脚本会自动获取最新标签版本并安装。如已是最新版本则跳过。
