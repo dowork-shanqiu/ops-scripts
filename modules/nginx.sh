@@ -169,12 +169,16 @@ _setup_compile_args() {
         "--group=${NGINX_GROUP}"
         "--with-http_ssl_module"
         "--with-http_v2_module"
+        "--with-http_v3_module"
+        "--with-http_addition_module"
         "--with-http_realip_module"
         "--with-http_gzip_static_module"
         "--with-http_stub_status_module"
         "--with-http_sub_module"
         "--with-stream"
         "--with-stream_ssl_module"
+        "--with-stream_realip_module"
+        "--with-pcre-jit"
         "--with-pcre=${NGINX_COMPILE_DIR}/${PCRE2_DIR_NAME}"
         "--with-zlib=${NGINX_COMPILE_DIR}/${ZLIB_DIR_NAME}"
         "--with-openssl=${NGINX_COMPILE_DIR}/${OPENSSL_DIR_NAME}"
@@ -198,7 +202,10 @@ _setup_compile_args() {
     echo "  7) --with-http_flv_module"
     echo "  8) --with-http_mp4_module"
     echo "  9) --with-http_secure_link_module"
-    echo " 10) --with-stream_realip_module"
+    echo " 10) --with-http_slice_module"
+    echo " 11) --with-stream_realip_module"
+    echo " 12) --with-compat"
+    echo " 13) --with-threads"
     echo ""
 
     local extra_args=()
@@ -219,7 +226,10 @@ _setup_compile_args() {
                 7) extra_args+=("--with-http_flv_module") ;;
                 8) extra_args+=("--with-http_mp4_module") ;;
                 9) extra_args+=("--with-http_secure_link_module") ;;
-                10) extra_args+=("--with-stream_realip_module") ;;
+                10) extra_args+=("--with-http_slice_module") ;;
+                11) extra_args+=("--with-stream_realip_module") ;;
+                12) extra_args+=("--with-compat") ;;
+                13) extra_args+=("--with-threads") ;;
                 *) log_warn "忽略未知编号: ${num}" ;;
             esac
         done
