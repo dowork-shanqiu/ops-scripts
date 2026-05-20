@@ -45,6 +45,32 @@ _get_latest_pcre2_version() {
     echo "$ver"
 }
 
+_get_latest_geoip2_module_version() {
+    local ver
+    ver=$(curl -s --connect-timeout 10 "https://api.github.com/repos/leev/ngx_http_geoip2_module/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name":\s*"\K[0-9]+\.[0-9]+' | head -1)
+    echo "$ver"
+}
+
+# ============================================================
+# 配置 GeoIP2 模块
+# ============================================================
+_configure_geoip2_module() {
+    local latest_geoip2="$1"
+
+    GEOIP2_MODULE_ENABLED=false
+    GEOIP2_MODULE_DIR_NAME=""
+    echo ""
+    if confirm "是否启用 ngx_http_geoip2_module? (基于 MaxMind GeoIP2 的地理位置模块)"; then
+        GEOIP2_MODULE_ENABLED=true
+        local geoip2_module_version="$latest_geoip2"
+        if confirm "是否指定 ngx_http_geoip2_module 版本号? (默认: ${latest_geoip2})"; then
+            read_nonempty "请输入 ngx_http_geoip2_module 版本号" geoip2_module_version
+        fi
+        GEOIP2_MODULE_DIR_NAME="ngx_http_geoip2_module-${geoip2_module_version}"
+    fi
+}
+
 # ============================================================
 # 安装编译依赖
 # ============================================================
@@ -54,6 +80,7 @@ _install_compile_deps() {
         build-essential \
         libgd-dev \
         libgeoip-dev \
+        libmaxminddb-dev \
         libxml2-dev \
         libxslt1-dev \
         perl \
@@ -331,18 +358,22 @@ nginx_install() {
     latest_zlib=$(_get_latest_zlib_version)
     latest_openssl=$(_get_latest_openssl_version)
     latest_pcre2=$(_get_latest_pcre2_version)
+    local latest_geoip2
+    latest_geoip2=$(_get_latest_geoip2_module_version)
 
     [ -z "$latest_nginx" ] && latest_nginx="1.26.3"
     [ -z "$latest_zlib" ] && latest_zlib="1.3.1"
     [ -z "$latest_openssl" ] && latest_openssl="3.4.1"
     [ -z "$latest_pcre2" ] && latest_pcre2="10.44"
+    [ -z "$latest_geoip2" ] && latest_geoip2="3.4"
 
     echo ""
     log_info "检测到最新版本:"
-    echo "  Nginx:   ${latest_nginx}"
-    echo "  zlib:    ${latest_zlib}"
-    echo "  OpenSSL: ${latest_openssl}"
-    echo "  PCRE2:   ${latest_pcre2}"
+    echo "  Nginx:                  ${latest_nginx}"
+    echo "  zlib:                   ${latest_zlib}"
+    echo "  OpenSSL:                ${latest_openssl}"
+    echo "  PCRE2:                  ${latest_pcre2}"
+    echo "  ngx_http_geoip2_module: ${latest_geoip2}"
     echo ""
 
     # Nginx 版本
@@ -369,6 +400,10 @@ nginx_install() {
         read_nonempty "请输入 PCRE2 版本号" pcre2_version
     fi
 
+    # GeoIP2 模块
+    _configure_geoip2_module "$latest_geoip2"
+    local geoip2_module_version="${GEOIP2_MODULE_DIR_NAME#ngx_http_geoip2_module-}"
+
     # 用于 configure 引用的目录名
     ZLIB_DIR_NAME="zlib-${zlib_version}"
     OPENSSL_DIR_NAME="openssl-${openssl_version}"
@@ -380,6 +415,12 @@ nginx_install() {
     # ---- 编译参数 ----
     _setup_compile_args
 
+    # 如启用 GeoIP2 模块，追加 --add-module 参数
+    if [ "$GEOIP2_MODULE_ENABLED" = true ]; then
+        CONFIGURE_ARGS+=("--add-module=${NGINX_COMPILE_DIR}/${GEOIP2_MODULE_DIR_NAME}")
+        log_info "已追加编译参数: --add-module=${NGINX_COMPILE_DIR}/${GEOIP2_MODULE_DIR_NAME}"
+    fi
+
     # ---- 确认 ----
     echo ""
     print_separator
@@ -388,6 +429,9 @@ nginx_install() {
     echo "  zlib 版本:    ${zlib_version}"
     echo "  OpenSSL 版本: ${openssl_version}"
     echo "  PCRE2 版本:   ${pcre2_version}"
+    if [ "$GEOIP2_MODULE_ENABLED" = true ]; then
+        echo "  GeoIP2 模块:  ${geoip2_module_version} (ngx_http_geoip2_module)"
+    fi
     echo "  运行用户:     ${NGINX_USER}"
     echo "  运行用户组:   ${NGINX_GROUP}"
     echo "  编译目录:     ${NGINX_COMPILE_DIR}"
@@ -420,6 +464,11 @@ nginx_install() {
 
     _download_and_extract "PCRE2 ${pcre2_version}" \
         "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${pcre2_version}/pcre2-${pcre2_version}.tar.gz"
+
+    if [ "$GEOIP2_MODULE_ENABLED" = true ]; then
+        _download_and_extract "ngx_http_geoip2_module ${geoip2_module_version}" \
+            "https://github.com/leev/ngx_http_geoip2_module/archive/refs/tags/${geoip2_module_version}.tar.gz"
+    fi
 
     # 编译 Nginx
     log_step "开始编译 Nginx..."
