@@ -6,8 +6,8 @@
 # - 安装后不允许重复安装
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+CADDY_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CADDY_MODULE_DIR}/common.sh"
 
 CADDY_MARKER="/etc/ops-scripts/.caddy_installed"
 CADDY_CONF_DIR="/etc/caddy.d"
@@ -191,7 +191,7 @@ caddy_status() {
     echo ""
 
     log_step "服务状态:"
-    systemctl status caddy --no-pager 2>/dev/null | head -15
+    systemctl status caddy --no-pager 2>/dev/null | sed -n '1,15p' || true
     echo ""
 
     log_step "配置文件目录 (${CADDY_CONF_DIR}):"
@@ -242,7 +242,7 @@ caddy_service() {
             case "$SELECTED_OPTION" in
                 1) journalctl -u caddy -n 50 --no-pager ;;
                 2) journalctl -u caddy -n 100 --no-pager ;;
-                3) journalctl -u caddy -f ;;
+                3) journalctl -u caddy -f || true ;;
             esac
             ;;
         0) return 0 ;;

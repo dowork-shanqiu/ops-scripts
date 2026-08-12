@@ -6,8 +6,8 @@
 # - 启用/禁用服务开机自启
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+SERVICE_MGMT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SERVICE_MGMT_MODULE_DIR}/common.sh"
 
 # ============================================================
 # 查看服务列表
@@ -49,6 +49,10 @@ service_operate() {
 
     local service_name
     read_nonempty "请输入服务名称" service_name
+    if ! validate_service_name "$service_name"; then
+        log_error "服务名称格式无效"
+        return 1
+    fi
 
     # 检查服务是否存在
     if ! systemctl cat "$service_name" &>/dev/null; then
@@ -60,7 +64,7 @@ service_operate() {
     echo ""
     log_info "服务 '${service_name}' 当前状态:"
     print_thin_separator
-    systemctl status "$service_name" --no-pager 2>/dev/null
+    systemctl status "$service_name" --no-pager 2>/dev/null || true
     print_thin_separator
 
     echo ""
@@ -91,8 +95,7 @@ service_operate() {
             log_info "服务已重启"
             ;;
         4)
-            systemctl reload "$service_name" 2>/dev/null
-            if [ $? -eq 0 ]; then
+            if systemctl reload "$service_name" 2>/dev/null; then
                 log_info "配置已重载"
             else
                 log_warn "此服务不支持 reload，尝试重启..."
@@ -119,7 +122,7 @@ service_operate() {
                 1) journalctl -u "$service_name" -n 50 --no-pager ;;
                 2) journalctl -u "$service_name" -n 100 --no-pager ;;
                 3) journalctl -u "$service_name" --since today --no-pager ;;
-                4) journalctl -u "$service_name" -f ;;
+                4) journalctl -u "$service_name" -f || true ;;
             esac
             ;;
         0) return 0 ;;
@@ -127,7 +130,7 @@ service_operate() {
 
     # 显示操作后状态
     echo ""
-    systemctl status "$service_name" --no-pager 2>/dev/null | head -5
+    systemctl status "$service_name" --no-pager 2>/dev/null | sed -n '1,5p' || true
 }
 
 # ============================================================

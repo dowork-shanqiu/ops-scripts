@@ -6,8 +6,8 @@
 # - 安装基础工具
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+INIT_SYSTEM_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${INIT_SYSTEM_MODULE_DIR}/common.sh"
 
 # ---------- APT 源配置 ----------
 setup_apt_sources() {
@@ -38,10 +38,7 @@ setup_apt_sources() {
         esac
 
         if [ -n "$mirror_url" ]; then
-            log_step "备份当前 APT 源配置..."
-            cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
-
-            log_step "替换 APT 源为: ${mirror_url}"
+            log_step "准备替换 APT 源为: ${mirror_url}"
             detect_os
             local codename
             codename=$(lsb_release -cs 2>/dev/null || echo "")
@@ -53,31 +50,57 @@ setup_apt_sources() {
 
             if [ -z "$codename" ]; then
                 log_error "无法检测系统版本代号，跳过源替换"
-                return
+                return 1
             fi
 
             # 检查是否使用 DEB822 格式（Ubuntu 24.04+ 使用 .sources 文件）
             if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
                 log_info "检测到 DEB822 格式源配置"
-                cp /etc/apt/sources.list.d/ubuntu.sources "/etc/apt/sources.list.d/ubuntu.sources.bak.$(date +%Y%m%d%H%M%S)"
-                sed -i "s|http://archive.ubuntu.com|https://${mirror_url}|g" /etc/apt/sources.list.d/ubuntu.sources
-                sed -i "s|http://security.ubuntu.com|https://${mirror_url}|g" /etc/apt/sources.list.d/ubuntu.sources
-                sed -i "s|https://archive.ubuntu.com|https://${mirror_url}|g" /etc/apt/sources.list.d/ubuntu.sources
-                sed -i "s|https://security.ubuntu.com|https://${mirror_url}|g" /etc/apt/sources.list.d/ubuntu.sources
-            elif [ "$OS_ID" = "ubuntu" ]; then
-                cat > /etc/apt/sources.list << EOF
+                local sources_file="/etc/apt/sources.list.d/ubuntu.sources"
+                local sources_candidate sources_backup
+                sources_candidate=$(mktemp "${sources_file}.ops.XXXXXX") || return 1
+                sources_backup="${sources_file}.bak.$(date +%Y%m%d%H%M%S)"
+                if ! cp -p "$sources_file" "$sources_candidate" ||
+                   ! sed -i "s|http://archive.ubuntu.com|https://${mirror_url}|g; s|http://security.ubuntu.com|https://${mirror_url}|g; s|https://archive.ubuntu.com|https://${mirror_url}|g; s|https://security.ubuntu.com|https://${mirror_url}|g" "$sources_candidate" ||
+                   ! cp -p "$sources_file" "$sources_backup" ||
+                   ! mv -f "$sources_candidate" "$sources_file"; then
+                    rm -f "$sources_candidate"
+                    log_error "APT 源配置替换失败，原配置已保留"
+                    return 1
+                fi
+            elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
+                local sources_file="/etc/apt/sources.list"
+                local sources_candidate sources_backup=""
+                sources_candidate=$(mktemp /etc/apt/.sources.list.ops.XXXXXX) || return 1
+                if [ "$OS_ID" = "ubuntu" ]; then
+                    cat > "$sources_candidate" << EOF
 deb https://${mirror_url}/ubuntu/ ${codename} main restricted universe multiverse
 deb https://${mirror_url}/ubuntu/ ${codename}-updates main restricted universe multiverse
 deb https://${mirror_url}/ubuntu/ ${codename}-backports main restricted universe multiverse
 deb https://${mirror_url}/ubuntu/ ${codename}-security main restricted universe multiverse
 EOF
-            elif [ "$OS_ID" = "debian" ]; then
-                cat > /etc/apt/sources.list << EOF
+                else
+                    cat > "$sources_candidate" << EOF
 deb https://${mirror_url}/debian/ ${codename} main contrib non-free non-free-firmware
 deb https://${mirror_url}/debian/ ${codename}-updates main contrib non-free non-free-firmware
 deb https://${mirror_url}/debian/ ${codename}-backports main contrib non-free non-free-firmware
 deb https://${mirror_url}/debian-security/ ${codename}-security main contrib non-free non-free-firmware
 EOF
+                fi
+                chmod 0644 "$sources_candidate"
+                if [ -f "$sources_file" ]; then
+                    sources_backup="${sources_file}.bak.$(date +%Y%m%d%H%M%S)"
+                    if ! cp -p "$sources_file" "$sources_backup"; then
+                        rm -f "$sources_candidate"
+                        log_error "APT 源备份失败，原配置未修改"
+                        return 1
+                    fi
+                fi
+                if ! mv -f "$sources_candidate" "$sources_file"; then
+                    rm -f "$sources_candidate"
+                    log_error "APT 源配置替换失败，原配置已保留"
+                    return 1
+                fi
             fi
             log_info "APT 源替换完成"
         fi
@@ -89,8 +112,7 @@ EOF
 # ---------- 系统更新 ----------
 update_system() {
     log_step "正在更新系统..."
-    apt update && apt upgrade -y
-    if [ $? -eq 0 ]; then
+    if apt update && apt upgrade -y; then
         log_info "系统更新完成"
     else
         log_error "系统更新过程中出现错误，请检查网络连接"
@@ -143,12 +165,11 @@ install_base_packages() {
         packages+=(software-properties-common)
     fi
 
-    apt install -y "${packages[@]}"
-
-    if [ $? -eq 0 ]; then
+    if apt install -y "${packages[@]}"; then
         log_info "基础工具包安装完成"
     else
         log_warn "部分工具包安装可能失败，请检查日志"
+        return 1
     fi
 }
 
@@ -199,6 +220,7 @@ setup_timezone() {
         log_info "  当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
     else
         log_error "时区设置失败，请确认时区名称是否正确"
+        return 1
     fi
 }
 

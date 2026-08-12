@@ -7,8 +7,8 @@
 # - 查看用户列表
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+USER_MGMT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${USER_MGMT_MODULE_DIR}/common.sh"
 
 # ============================================================
 # 添加用户
@@ -22,6 +22,10 @@ user_add() {
     # 输入用户名
     local username
     read_nonempty "请输入用户名" username
+    if ! validate_username "$username"; then
+        log_error "用户名格式无效"
+        return 1
+    fi
 
     # 检查用户是否已存在
     if id "$username" &>/dev/null; then
@@ -37,14 +41,19 @@ user_add() {
     echo "  3) 不指定（使用系统默认）"
     select_option "请选择" 3
 
-    local group_opt=""
+    local primary_group=""
+    local created_primary_group=false
     case "$SELECTED_OPTION" in
         1)
             if ! getent group "$username" &>/dev/null; then
-                groupadd "$username"
+                if ! groupadd "$username"; then
+                    log_error "用户组 '${username}' 创建失败"
+                    return 1
+                fi
+                created_primary_group=true
                 log_info "已创建用户组: ${username}"
             fi
-            group_opt="-g ${username}"
+            primary_group="$username"
             ;;
         2)
             echo ""
@@ -63,7 +72,7 @@ user_add() {
             if [ ${#groups_list[@]} -gt 0 ]; then
                 select_option "请选择用户组" "${#groups_list[@]}"
                 local sel_group="${groups_list[$((SELECTED_OPTION - 1))]}"
-                group_opt="-g ${sel_group}"
+                primary_group="$sel_group"
                 log_info "已选择用户组: ${sel_group}"
             fi
             ;;
@@ -84,18 +93,34 @@ user_add() {
         done
         print_thin_separator
         read_nonempty "请输入附加用户组 (多个用逗号分隔)" supp_groups
+        local supp_group
+        local -a supp_group_items=()
+        IFS=',' read -r -a supp_group_items <<< "$supp_groups"
+        for supp_group in "${supp_group_items[@]}"; do
+            if ! validate_groupname "$supp_group" || ! getent group "$supp_group" &>/dev/null; then
+                log_error "附加用户组不存在或名称无效: ${supp_group}"
+                if [ "$created_primary_group" = true ]; then groupdel "$username" 2>/dev/null || true; fi
+                return 1
+            fi
+        done
     fi
 
     # --- 工作目录 ---
     echo ""
-    local home_opt=""
+    local create_home=false
+    local home_dir=""
     if confirm "是否为用户创建工作目录 (home)?"; then
-        local home_dir
         read_optional "工作目录路径" home_dir "/home/${username}"
-        home_opt="-m -d ${home_dir}"
+        if [[ "$home_dir" != /* || "$home_dir" == *:* || "$home_dir" =~ [[:cntrl:]] ]] ||
+           [[ "$home_dir" =~ ^/(etc|usr|var|root|bin|sbin|lib|lib64|boot|dev|proc|sys)(/|$) ]] ||
+           [ ! -d "$(dirname "$home_dir")" ]; then
+            log_error "工作目录必须是父目录已存在的安全绝对路径（建议位于 /home）"
+            if [ "$created_primary_group" = true ]; then groupdel "$username" 2>/dev/null || true; fi
+            return 1
+        fi
+        create_home=true
         log_info "工作目录: ${home_dir}"
     else
-        home_opt="-M"
         log_info "不创建工作目录"
     fi
 
@@ -132,7 +157,13 @@ user_add() {
     if confirm "是否设置账号过期时间?"; then
         local expire_date
         read_nonempty "请输入过期日期 (格式: YYYY-MM-DD)" expire_date
-        expire_opt="-e ${expire_date}"
+        if [[ ! "$expire_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+           [ "$(date -d "$expire_date" '+%F' 2>/dev/null || true)" != "$expire_date" ]; then
+            log_error "账号过期日期无效"
+            if [ "$created_primary_group" = true ]; then groupdel "$username" 2>/dev/null || true; fi
+            return 1
+        fi
+        expire_opt="$expire_date"
     fi
 
     # --- 是否允许登录 ---
@@ -148,27 +179,18 @@ user_add() {
 
     # --- 构建并执行命令 ---
     local cmd_args=()
-    if [ -n "$group_opt" ]; then
-        # group_opt is like "-g groupname"
-        cmd_args+=($group_opt)
+    if [ -n "$primary_group" ]; then
+        cmd_args+=("-g" "$primary_group")
     fi
     if [ -n "$supp_groups" ]; then
         cmd_args+=("-G" "$supp_groups")
     fi
-    if [ "$home_opt" = "-M" ]; then
-        cmd_args+=("-M")
-    else
-        # home_opt is like "-m -d /home/user"
-        cmd_args+=($home_opt)
-    fi
+    if [ "$create_home" = true ]; then cmd_args+=("-m" "-d" "$home_dir"); else cmd_args+=("-M"); fi
     cmd_args+=("-s" "$shell_opt")
     if [ -n "$comment" ]; then
         cmd_args+=("-c" "$comment")
     fi
-    if [ -n "$expire_opt" ]; then
-        # expire_opt is like "-e 2025-12-31"
-        cmd_args+=($expire_opt)
-    fi
+    if [ -n "$expire_opt" ]; then cmd_args+=("-e" "$expire_opt"); fi
     cmd_args+=("$username")
 
     echo ""
@@ -227,8 +249,17 @@ user_add() {
             print_thin_separator
         else
             log_error "用户创建失败"
+            if [ "$created_primary_group" = true ]; then
+                groupdel "$username" 2>/dev/null || true
+                log_info "已清理本次创建的用户组: ${username}"
+            fi
+            return 1
         fi
     else
+        if [ "$created_primary_group" = true ]; then
+            groupdel "$username" 2>/dev/null || true
+            log_info "已清理本次创建的用户组: ${username}"
+        fi
         log_info "已取消创建用户"
     fi
 }
@@ -303,11 +334,14 @@ user_delete() {
     fi
 
     if confirm "最终确认: 删除用户 '${del_user}'?"; then
-        userdel $force_opt $del_home "$del_user"
-        if [ $? -eq 0 ]; then
+        local userdel_args=()
+        [ -n "$force_opt" ] && userdel_args+=("$force_opt")
+        [ -n "$del_home" ] && userdel_args+=("$del_home")
+        if userdel "${userdel_args[@]}" "$del_user"; then
             log_info "用户 '${del_user}' 已删除"
         else
             log_error "删除用户失败"
+            return 1
         fi
     else
         log_info "已取消删除"

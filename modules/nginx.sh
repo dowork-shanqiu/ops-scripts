@@ -7,12 +7,47 @@
 # - 安装目录: /usr/local/nginx
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+NGINX_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${NGINX_MODULE_DIR}/common.sh"
 
 NGINX_MARKER="/etc/ops-scripts/.nginx_installed"
 NGINX_COMPILE_DIR="/opt/nginx-compile"
 NGINX_INSTALL_DIR="/usr/local/nginx"
+NGINX_CREATE_IDENTITY=false
+NGINX_CREATED_USER=false
+NGINX_CREATED_GROUP=false
+
+_cleanup_nginx_created_identity() {
+    if [ "$NGINX_CREATED_USER" = true ]; then
+        userdel "$NGINX_USER" 2>/dev/null || true
+        NGINX_CREATED_USER=false
+    fi
+    if [ "$NGINX_CREATED_GROUP" = true ]; then
+        groupdel "$NGINX_GROUP" 2>/dev/null || true
+        NGINX_CREATED_GROUP=false
+    fi
+}
+
+_create_nginx_identity() {
+    [ "$NGINX_CREATE_IDENTITY" = true ] || return 0
+    if ! getent group "$NGINX_GROUP" &>/dev/null; then
+        if ! groupadd -r "$NGINX_GROUP"; then
+            log_error "Nginx 用户组创建失败"
+            return 1
+        fi
+        NGINX_CREATED_GROUP=true
+        log_info "已创建用户组: ${NGINX_GROUP}"
+    fi
+    if ! id "$NGINX_USER" &>/dev/null; then
+        if ! useradd -r -g "$NGINX_GROUP" -s /usr/sbin/nologin -M "$NGINX_USER"; then
+            _cleanup_nginx_created_identity
+            log_error "Nginx 用户创建失败"
+            return 1
+        fi
+        NGINX_CREATED_USER=true
+        log_info "已创建用户: ${NGINX_USER}"
+    fi
+}
 
 # ============================================================
 # 获取最新版本号
@@ -20,35 +55,35 @@ NGINX_INSTALL_DIR="/usr/local/nginx"
 _get_latest_nginx_version() {
     local ver
     ver=$(curl -s --connect-timeout 10 "https://nginx.org/en/download.html" 2>/dev/null \
-        | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1p' || true)
     echo "$ver"
 }
 
 _get_latest_zlib_version() {
     local ver
     ver=$(curl -s --connect-timeout 10 "https://zlib.net/" 2>/dev/null \
-        | grep -oP 'zlib-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        | grep -oP 'zlib-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | sed -n '1p' || true)
     echo "$ver"
 }
 
 _get_latest_openssl_version() {
     local ver
     ver=$(curl -s --connect-timeout 10 "https://api.github.com/repos/openssl/openssl/releases" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"openssl-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        | grep -oP '"tag_name":\s*"openssl-\K[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1p' || true)
     echo "$ver"
 }
 
 _get_latest_pcre2_version() {
     local ver
     ver=$(curl -s --connect-timeout 10 "https://api.github.com/repos/PCRE2Project/pcre2/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"pcre2-\K[0-9]+\.[0-9]+' | head -1)
+        | grep -oP '"tag_name":\s*"pcre2-\K[0-9]+\.[0-9]+' | sed -n '1p' || true)
     echo "$ver"
 }
 
 _get_latest_geoip2_module_version() {
     local ver
     ver=$(curl -s --connect-timeout 10 "https://api.github.com/repos/leev/ngx_http_geoip2_module/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"\K[0-9]+\.[0-9]+' | head -1)
+        | grep -oP '"tag_name":\s*"\K[0-9]+\.[0-9]+' | sed -n '1p' || true)
     echo "$ver"
 }
 
@@ -66,6 +101,10 @@ _configure_geoip2_module() {
         local geoip2_module_version="$latest_geoip2"
         if confirm "是否指定 ngx_http_geoip2_module 版本号? (默认: ${latest_geoip2})"; then
             read_nonempty "请输入 ngx_http_geoip2_module 版本号" geoip2_module_version
+        fi
+        if [[ ! "$geoip2_module_version" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]]; then
+            log_error "GeoIP2 模块版本号格式无效"
+            return 1
         fi
         GEOIP2_MODULE_DIR_NAME="ngx_http_geoip2_module-${geoip2_module_version}"
     fi
@@ -98,6 +137,10 @@ _download_and_extract() {
     log_step "下载 ${name}..."
     local filename
     filename=$(basename "$url")
+    if [[ "$filename" != *.tar.gz && "$filename" != *.tar.xz && "$filename" != *.tgz ]]; then
+        log_error "不支持的源码归档格式: ${filename}"
+        return 1
+    fi
 
     if [ -f "${NGINX_COMPILE_DIR}/${filename}" ]; then
         log_info "${filename} 已存在，跳过下载"
@@ -108,8 +151,31 @@ _download_and_extract() {
         fi
     fi
 
+    local archive_path="${NGINX_COMPILE_DIR}/${filename}"
+    local expected_dir="${filename%.tar.gz}"
+    expected_dir="${expected_dir%.tar.xz}"
+    expected_dir="${expected_dir%.tgz}"
+    if [[ ! "$expected_dir" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        log_error "归档目录名称无效: ${expected_dir}"
+        return 1
+    fi
+    if tar -tf "$archive_path" | awk '
+        /^\// { bad=1 }
+        { n=split($0, p, "/"); for (i=1; i<=n; i++) if (p[i] == "..") bad=1 }
+        END { exit bad ? 0 : 1 }
+    '; then
+        log_error "归档包含绝对路径或路径穿越条目，拒绝解压"
+        return 1
+    fi
+    if ! tar -tf "$archive_path" | awk -v expected="$expected_dir/" 'index($0, expected) == 1 { found=1 } END { exit !found }'; then
+        log_error "归档不包含预期目录: ${expected_dir}"
+        return 1
+    fi
     log_step "解压 ${name}..."
-    tar -xf "${NGINX_COMPILE_DIR}/${filename}" -C "${NGINX_COMPILE_DIR}"
+    if ! tar -xf "$archive_path" -C "$NGINX_COMPILE_DIR"; then
+        log_error "${name} 解压失败"
+        return 1
+    fi
     log_info "${name} 解压完成"
 }
 
@@ -125,23 +191,17 @@ _setup_nginx_user() {
     select_option "请选择" 2
 
     if [ "$SELECTED_OPTION" -eq 1 ]; then
+        NGINX_CREATE_IDENTITY=true
         read_optional "Nginx 用户名" NGINX_USER "nginx"
         read_optional "Nginx 用户组" NGINX_GROUP "$NGINX_USER"
-
-        # 创建用户组
-        if ! getent group "$NGINX_GROUP" &>/dev/null; then
-            groupadd -r "$NGINX_GROUP"
-            log_info "已创建用户组: ${NGINX_GROUP}"
-        else
-            log_info "用户组 '${NGINX_GROUP}' 已存在"
+        if ! validate_username "$NGINX_USER" || ! validate_groupname "$NGINX_GROUP"; then
+            log_error "Nginx 用户名或用户组名格式无效"
+            return 1
         fi
 
-        # 创建用户
-        if ! id "$NGINX_USER" &>/dev/null; then
-            useradd -r -g "$NGINX_GROUP" -s /usr/sbin/nologin -M "$NGINX_USER"
-            log_info "已创建用户: ${NGINX_USER}"
-        else
-            log_info "用户 '${NGINX_USER}' 已存在"
+        if id "$NGINX_USER" &>/dev/null && [ "$(id -gn "$NGINX_USER")" != "$NGINX_GROUP" ]; then
+            log_error "已有用户 '${NGINX_USER}' 的主组不是 '${NGINX_GROUP}'"
+            return 1
         fi
     else
         # 列出可用用户
@@ -404,6 +464,14 @@ nginx_install() {
     _configure_geoip2_module "$latest_geoip2"
     local geoip2_module_version="${GEOIP2_MODULE_DIR_NAME#ngx_http_geoip2_module-}"
 
+    if [[ ! "$nginx_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+       [[ ! "$zlib_version" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]] ||
+       [[ ! "$openssl_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9.-]*)$ ]] ||
+       [[ ! "$pcre2_version" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]]; then
+        log_error "一个或多个源码版本号格式无效"
+        return 1
+    fi
+
     # 用于 configure 引用的目录名
     ZLIB_DIR_NAME="zlib-${zlib_version}"
     OPENSSL_DIR_NAME="openssl-${openssl_version}"
@@ -444,42 +512,69 @@ nginx_install() {
         return 0
     fi
 
+    if ! _create_nginx_identity; then
+        return 1
+    fi
+
     # ---- 开始安装 ----
     # 安装编译依赖
-    _install_compile_deps
+    if ! _install_compile_deps; then
+        _cleanup_nginx_created_identity
+        return 1
+    fi
 
     # 创建编译目录
     mkdir -p "$NGINX_COMPILE_DIR"
-    cd "$NGINX_COMPILE_DIR" || exit 1
+    cd "$NGINX_COMPILE_DIR" || {
+        _cleanup_nginx_created_identity
+        return 1
+    }
 
     # 下载源码
-    _download_and_extract "Nginx ${nginx_version}" \
-        "https://nginx.org/download/nginx-${nginx_version}.tar.gz"
+    if ! _download_and_extract "Nginx ${nginx_version}" \
+        "https://nginx.org/download/nginx-${nginx_version}.tar.gz"; then
+        _cleanup_nginx_created_identity
+        return 1
+    fi
 
-    _download_and_extract "zlib ${zlib_version}" \
-        "https://zlib.net/zlib-${zlib_version}.tar.gz"
+    if ! _download_and_extract "zlib ${zlib_version}" \
+        "https://zlib.net/zlib-${zlib_version}.tar.gz"; then
+        _cleanup_nginx_created_identity
+        return 1
+    fi
 
-    _download_and_extract "OpenSSL ${openssl_version}" \
-        "https://github.com/openssl/openssl/releases/download/openssl-${openssl_version}/openssl-${openssl_version}.tar.gz"
+    if ! _download_and_extract "OpenSSL ${openssl_version}" \
+        "https://github.com/openssl/openssl/releases/download/openssl-${openssl_version}/openssl-${openssl_version}.tar.gz"; then
+        _cleanup_nginx_created_identity
+        return 1
+    fi
 
-    _download_and_extract "PCRE2 ${pcre2_version}" \
-        "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${pcre2_version}/pcre2-${pcre2_version}.tar.gz"
+    if ! _download_and_extract "PCRE2 ${pcre2_version}" \
+        "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${pcre2_version}/pcre2-${pcre2_version}.tar.gz"; then
+        _cleanup_nginx_created_identity
+        return 1
+    fi
 
     if [ "$GEOIP2_MODULE_ENABLED" = true ]; then
-        _download_and_extract "ngx_http_geoip2_module ${geoip2_module_version}" \
-            "https://github.com/leev/ngx_http_geoip2_module/archive/refs/tags/${geoip2_module_version}.tar.gz"
+        if ! _download_and_extract "ngx_http_geoip2_module ${geoip2_module_version}" \
+            "https://github.com/leev/ngx_http_geoip2_module/archive/refs/tags/${geoip2_module_version}.tar.gz"; then
+            _cleanup_nginx_created_identity
+            return 1
+        fi
     fi
 
     # 编译 Nginx
     log_step "开始编译 Nginx..."
     cd "${NGINX_COMPILE_DIR}/nginx-${nginx_version}" || {
         log_error "无法进入 Nginx 源码目录"
+        _cleanup_nginx_created_identity
         return 1
     }
 
     log_step "执行 configure..."
     if ! ./configure "${CONFIGURE_ARGS[@]}"; then
         log_error "configure 失败，请检查错误信息"
+        _cleanup_nginx_created_identity
         return 1
     fi
 
@@ -488,12 +583,14 @@ nginx_install() {
     log_step "执行 make (使用 ${cpu_cores} 核编译)..."
     if ! make -j"$cpu_cores"; then
         log_error "make 失败，请检查错误信息"
+        _cleanup_nginx_created_identity
         return 1
     fi
 
     log_step "执行 make install..."
     if ! make install; then
         log_error "make install 失败"
+        _cleanup_nginx_created_identity
         return 1
     fi
 
@@ -550,7 +647,7 @@ nginx_status() {
     echo ""
 
     log_step "服务状态:"
-    systemctl status nginx --no-pager 2>/dev/null | head -15
+    systemctl status nginx --no-pager 2>/dev/null | sed -n '1,15p' || true
     echo ""
 
     log_step "编译参数:"

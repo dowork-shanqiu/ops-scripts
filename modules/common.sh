@@ -146,7 +146,7 @@ is_china_network() {
 
     # 方式2: 通过 ipapi.co 查询 IP 归属地（备用）
     local country
-    country=$(curl -s --connect-timeout 5 --max-time 8 "https://ipapi.co/country/" 2>/dev/null)
+    country=$(curl -s --connect-timeout 5 --max-time 8 "https://ipapi.co/country/" 2>/dev/null || true)
     if [ "$country" = "CN" ]; then
         return 0
     fi
@@ -157,12 +157,64 @@ is_china_network() {
 # ---------- 确保标记目录存在 ----------
 ensure_marker_dir() {
     mkdir -p /etc/ops-scripts
+    chmod 700 /etc/ops-scripts
+}
+
+# ---------- 输入与路径验证 ----------
+validate_port() {
+    local value="${1:-}"
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 65535 ]
+}
+
+validate_nonnegative_integer() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+validate_username() {
+    [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+validate_groupname() {
+    validate_username "${1:-}"
+}
+
+validate_service_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:-]*$ ]]
+}
+
+validate_https_url() {
+    local value="${1:-}"
+    [[ "$value" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?([:/][^[:space:]]*)?$ ]]
+}
+
+validate_http_header() {
+    local value="${1:-}"
+    [[ "$value" =~ ^[A-Za-z0-9!#$%\&\'*+.^_\`\|~-]+:[[:space:]]*[^[:cntrl:]]+$ ]]
+}
+
+# 仅规范化已经存在的目录，调用者可以据此做允许范围判断。
+normalize_existing_directory() {
+    local target="${1:-}"
+    [ -n "$target" ] && [ -d "$target" ] || return 1
+    (cd -- "$target" 2>/dev/null && pwd -P)
+}
+
+# 自定义日志清理必须限定在常见日志/应用数据目录的子目录内，并拒绝过宽目标。
+is_safe_cleanup_directory() {
+    local normalized
+    normalized=$(normalize_existing_directory "${1:-}") || return 1
+
+    case "$normalized" in
+        /|/etc|/usr|/var|/var/lib|/home|/root|/opt|/srv|/tmp) return 1 ;;
+        /var/log/*|/var/lib/*/*|/opt/*|/srv/*|/home/*/*|/root/*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # ---------- 获取当前 SSH 端口 ----------
 get_ssh_port() {
     local port
-    port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    port=$(awk '/^[[:space:]]*Port[[:space:]]+/ { print $2; exit }' /etc/ssh/sshd_config 2>/dev/null || true)
     if [ -z "$port" ]; then
         port=22
     fi
@@ -203,7 +255,7 @@ validate_ssh_pubkey() {
 # ---------- 检测系统中可用的 shell ----------
 list_available_shells() {
     if [ -f /etc/shells ]; then
-        grep -v '^#' /etc/shells | grep -v '^$'
+        awk '!/^[[:space:]]*#/ && NF' /etc/shells
     else
         echo "/bin/bash"
         echo "/bin/sh"
@@ -232,21 +284,33 @@ load_mirror_config() {
     MIRROR_HEADERS=()
     MIRROR_CURL_ARGS=()
     [ -f "$MIRROR_CONF_FILE" ] || return 0
+    ensure_marker_dir
+    chmod 600 "$MIRROR_CONF_FILE"
 
     local raw
-    raw=$(grep "^MIRROR_URL=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    raw=$(awk -F= '/^MIRROR_URL=/ { sub(/^[^=]*=/, ""); print; exit }' "$MIRROR_CONF_FILE" 2>/dev/null) || true
     MIRROR_URL="${raw:-}"
+    if [ -n "$MIRROR_URL" ] && ! validate_https_url "$MIRROR_URL"; then
+        log_warn "镜像配置中的地址不是有效的 HTTPS URL，已忽略"
+        MIRROR_URL=""
+    fi
 
     local count=0
-    raw=$(grep "^HEADER_COUNT=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
+    raw=$(awk -F= '/^HEADER_COUNT=/ { sub(/^[^=]*=/, ""); print; exit }' "$MIRROR_CONF_FILE" 2>/dev/null) || true
     count="${raw:-0}"
+    if ! validate_nonnegative_integer "$count" || [ "$count" -gt 100 ]; then
+        log_warn "镜像配置中的请求头数量无效，已忽略请求头"
+        count=0
+    fi
 
     local i=0
     while [ "$i" -lt "${count}" ]; do
-        raw=$(grep "^HEADER_${i}=" "$MIRROR_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-) || true
-        if [ -n "${raw:-}" ]; then
+        raw=$(awk -v prefix="HEADER_${i}=" 'index($0, prefix) == 1 { sub(/^[^=]*=/, ""); print; exit }' "$MIRROR_CONF_FILE" 2>/dev/null) || true
+        if [ -n "${raw:-}" ] && validate_http_header "$raw"; then
             MIRROR_HEADERS+=("$raw")
             MIRROR_CURL_ARGS+=(-H "$raw")
+        elif [ -n "${raw:-}" ]; then
+            log_warn "镜像配置中存在无效请求头，已忽略"
         fi
         (( i++ )) || true
     done
@@ -255,6 +319,9 @@ load_mirror_config() {
 # 保存镜像配置到文件
 save_mirror_config() {
     ensure_marker_dir
+    local tmpfile
+    tmpfile=$(mktemp "${MIRROR_CONF_FILE}.tmp.XXXXXX") || return 1
+    chmod 600 "$tmpfile"
     {
         printf 'MIRROR_URL=%s\n' "${MIRROR_URL}"
         printf 'HEADER_COUNT=%d\n' "${#MIRROR_HEADERS[@]}"
@@ -263,7 +330,12 @@ save_mirror_config() {
             printf 'HEADER_%d=%s\n' "$i" "$h"
             (( i++ )) || true
         done
-    } > "$MIRROR_CONF_FILE"
+    } > "$tmpfile"
+    if ! mv -f "$tmpfile" "$MIRROR_CONF_FILE"; then
+        rm -f "$tmpfile"
+        return 1
+    fi
+    chmod 600 "$MIRROR_CONF_FILE"
 }
 
 # 构建带镜像前缀的完整 URL
@@ -309,7 +381,7 @@ _configure_mirror_headers() {
         if [ -z "$h" ]; then
             break
         fi
-        if ! echo "$h" | grep -q ": "; then
+        if ! validate_http_header "$h"; then
             log_warn "格式不正确，请使用 'Header-Name: value' 格式"
             continue
         fi
@@ -346,8 +418,8 @@ configure_mirror_interactive() {
                 echo ""
                 local new_url
                 read_nonempty "请输入镜像地址 (如: https://gh-proxy.example.com)" new_url
-                if ! echo "$new_url" | grep -qE '^https?://[a-zA-Z0-9]'; then
-                    log_error "地址格式不正确，请以 http:// 或 https:// 开头并包含有效域名"
+                if ! validate_https_url "$new_url"; then
+                    log_error "地址格式不正确，请使用有效的 HTTPS URL"
                     press_any_key
                     continue
                 fi
@@ -415,10 +487,13 @@ check_and_install_deps() {
 
     if confirm "是否立即安装所需依赖?"; then
         log_info "正在安装依赖..."
-        apt update -qq && apt install -y "${missing_pkgs[@]}"
-        echo ""
-        log_info "✓ 依赖安装完成"
-        return 0
+        if apt update -qq && apt install -y "${missing_pkgs[@]}"; then
+            echo ""
+            log_info "✓ 依赖安装完成"
+            return 0
+        fi
+        log_error "依赖安装失败"
+        return 1
     else
         log_warn "未安装依赖，返回上级菜单"
         press_any_key

@@ -7,8 +7,23 @@
 # - 编辑定时任务
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+CRON_MGMT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CRON_MGMT_MODULE_DIR}/common.sh"
+
+_validate_cron_user() {
+    validate_username "${1:-}" && id "${1:-}" &>/dev/null
+}
+
+_validate_cron_expression() {
+    local expression="${1:-}"
+    local -a fields=()
+    read -r -a fields <<< "$expression"
+    [ "${#fields[@]}" -eq 5 ] || return 1
+    local field
+    for field in "${fields[@]}"; do
+        [[ "$field" =~ ^[0-9*/?,\-]+$ ]] || return 1
+    done
+}
 
 # ============================================================
 # 查看定时任务
@@ -38,6 +53,10 @@ cron_list() {
         2)
             local username
             read_nonempty "请输入用户名" username
+            if ! _validate_cron_user "$username"; then
+                log_error "用户名无效或用户不存在"
+                return 1
+            fi
             log_step "${username} 的定时任务:"
             print_thin_separator
             crontab -u "$username" -l 2>/dev/null || echo "  没有定时任务"
@@ -119,6 +138,11 @@ cron_add() {
                 local hour minute
                 read_nonempty "请输入小时 (0-23)" hour
                 read_nonempty "请输入分钟 (0-59)" minute
+                if ! validate_nonnegative_integer "$hour" || [ "$hour" -gt 23 ] ||
+                   ! validate_nonnegative_integer "$minute" || [ "$minute" -gt 59 ]; then
+                    log_error "小时必须为 0-23，分钟必须为 0-59"
+                    return 1
+                fi
                 cron_expr="${minute} ${hour} * * *"
                 ;;
             8)  cron_expr="0 0 * * 1" ;;
@@ -130,6 +154,11 @@ cron_add() {
         log_info "Cron 表达式格式: 分 时 日 月 周"
         log_info "示例: */5 * * * * (每5分钟)"
         read_nonempty "请输入 cron 表达式" cron_expr
+    fi
+
+    if ! _validate_cron_expression "$cron_expr"; then
+        log_error "Cron 表达式必须包含 5 个有效时间字段"
+        return 1
     fi
 
     # 输入要执行的命令
@@ -165,6 +194,10 @@ cron_add() {
     if confirm "是否为其他用户添加? (默认 root)"; then
         read_nonempty "请输入用户名" target_user
     fi
+    if ! _validate_cron_user "$target_user"; then
+        log_error "用户名无效或用户不存在"
+        return 1
+    fi
 
     # 确认并添加
     local full_entry="${cron_expr} ${cron_cmd}"
@@ -180,18 +213,20 @@ cron_add() {
     if confirm "确认添加此定时任务?"; then
         local tmpfile
         tmpfile=$(mktemp)
-        crontab -u "$target_user" -l 2>/dev/null > "$tmpfile"
+        crontab -u "$target_user" -l 2>/dev/null > "$tmpfile" || true
         if [ -n "$comment" ]; then
             echo "# ${comment}" >> "$tmpfile"
         fi
         echo "$full_entry" >> "$tmpfile"
-        crontab -u "$target_user" "$tmpfile"
+        local cron_status=0
+        crontab -u "$target_user" "$tmpfile" || cron_status=$?
         rm -f "$tmpfile"
 
-        if [ $? -eq 0 ]; then
+        if [ "$cron_status" -eq 0 ]; then
             log_info "定时任务添加成功"
         else
             log_error "定时任务添加失败"
+            return "$cron_status"
         fi
     else
         log_info "已取消添加"
@@ -211,9 +246,13 @@ cron_delete() {
     if confirm "是否操作其他用户的定时任务? (默认 root)"; then
         read_nonempty "请输入用户名" target_user
     fi
+    if ! _validate_cron_user "$target_user"; then
+        log_error "用户名无效或用户不存在"
+        return 1
+    fi
 
     local current_cron
-    current_cron=$(crontab -u "$target_user" -l 2>/dev/null)
+    current_cron=$(crontab -u "$target_user" -l 2>/dev/null || true)
 
     if [ -z "$current_cron" ]; then
         log_warn "用户 '${target_user}' 没有定时任务"
@@ -241,9 +280,15 @@ cron_delete() {
                 local tmpfile
                 tmpfile=$(mktemp)
                 echo "$current_cron" | sed "${line_num}d" > "$tmpfile"
-                crontab -u "$target_user" "$tmpfile"
+                local cron_status=0
+                crontab -u "$target_user" "$tmpfile" || cron_status=$?
                 rm -f "$tmpfile"
-                log_info "定时任务已删除"
+                if [ "$cron_status" -eq 0 ]; then
+                    log_info "定时任务已删除"
+                else
+                    log_error "定时任务删除失败"
+                    return "$cron_status"
+                fi
             else
                 log_error "无效的行号"
             fi
@@ -267,6 +312,10 @@ cron_edit() {
     local target_user="root"
     if confirm "是否编辑其他用户的定时任务? (默认 root)"; then
         read_nonempty "请输入用户名" target_user
+    fi
+    if ! _validate_cron_user "$target_user"; then
+        log_error "用户名无效或用户不存在"
+        return 1
     fi
 
     log_info "正在打开编辑器..."

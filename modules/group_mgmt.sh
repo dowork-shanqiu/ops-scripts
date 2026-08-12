@@ -7,8 +7,8 @@
 # - 查看用户组列表
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+GROUP_MGMT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${GROUP_MGMT_MODULE_DIR}/common.sh"
 
 # ============================================================
 # 添加用户组
@@ -21,6 +21,10 @@ group_add() {
 
     local groupname
     read_nonempty "请输入用户组名" groupname
+    if ! validate_groupname "$groupname"; then
+        log_error "用户组名格式无效"
+        return 1
+    fi
 
     # 检查用户组是否已存在
     if getent group "$groupname" &>/dev/null; then
@@ -218,11 +222,11 @@ group_delete() {
 
     echo ""
     if confirm "确认删除用户组 '${del_group}'?"; then
-        groupdel "$del_group"
-        if [ $? -eq 0 ]; then
+        if groupdel "$del_group"; then
             log_info "用户组 '${del_group}' 已删除"
         else
             log_error "删除用户组失败"
+            return 1
         fi
     else
         log_info "已取消删除"

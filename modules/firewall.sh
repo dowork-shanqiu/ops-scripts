@@ -5,12 +5,522 @@
 # - 规则增删改查
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+FIREWALL_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${FIREWALL_MODULE_DIR}/common.sh"
 
 NFTABLES_DIR="/etc/nftables.d"
 NFTABLES_BASE_CONF="${NFTABLES_DIR}/base.conf"
 NFTABLES_MAIN_CONF="/etc/nftables.conf"
+IP_FORWARD_CONF="/etc/sysctl.d/99-ops-scripts-forward.conf"
+
+_fw_validate_port() {
+    local value="$1" start end
+    if [[ "$value" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]]; then
+        start="${BASH_REMATCH[1]}"
+        end="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+        [ "$start" -ge 1 ] && [ "$start" -le 65535 ] \
+            && [ "$end" -ge 1 ] && [ "$end" -le 65535 ] \
+            && [ "$start" -le "$end" ]
+        return
+    fi
+    return 1
+}
+
+_fw_validate_single_port() {
+    _fw_validate_port "$1" && [[ "$1" != *-* ]]
+}
+
+_fw_validate_ipv4() {
+    local address="${1%%/*}" prefix="" octet
+    local -a octets
+    if [[ "$1" == */* ]]; then
+        prefix="${1##*/}"
+        [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && [ "$prefix" -le 32 ] || return 1
+    fi
+    IFS='.' read -r -a octets <<< "$address"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
+_fw_validate_ip_cidr() {
+    local value="$1" address prefix rest piece compressed=false groups=0
+    local -a pieces
+    if [[ "$value" == *:* ]]; then
+        [[ "$value" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] || return 1
+        address="${value%%/*}"
+        [[ "$address" == *:* ]] && [[ "$address" != *:::* ]] || return 1
+        if [[ "$address" == *::* ]]; then
+            compressed=true
+            rest="${address#*::}"
+            [[ "$rest" != *::* ]] || return 1
+        fi
+        IFS=':' read -r -a pieces <<< "${address//::/:x:}"
+        for piece in "${pieces[@]}"; do
+            [ -z "$piece" ] && continue
+            if [ "$piece" = x ]; then
+                continue
+            fi
+            [[ "$piece" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+            groups=$((groups + 1))
+        done
+        if [ "$compressed" = true ]; then
+            [ "$groups" -lt 8 ] || return 1
+        else
+            [ "$groups" -eq 8 ] || return 1
+        fi
+        if [[ "$value" == */* ]]; then
+            prefix="${value##*/}"
+            [ "$((10#$prefix))" -le 128 ] || return 1
+        fi
+        return 0
+    fi
+    _fw_validate_ipv4 "$value"
+}
+
+_fw_address_family_keyword() {
+    if [[ "$1" == *:* ]]; then
+        printf 'ip6'
+    else
+        printf 'ip'
+    fi
+}
+
+_fw_validate_rate() {
+    [[ "$1" =~ ^([1-9][0-9]{0,6})/(second|minute|hour)$ ]]
+}
+
+_fw_write_base_conf() {
+    local output="$1" ssh_port="$2" enable_web="${3:-false}"
+    {
+        printf '%s\n' '#!/usr/sbin/nft -f'
+        printf '%s\n' '# OPS-SCRIPTS FIREWALL BASE v2'
+        printf '%s\n' '# 自定义规则使用普通链，所有最终判定均在同一个 input base chain 中完成。'
+        printf '%s\n' 'table inet ops_filter {'
+        printf '%s\n' '    chain ops_blacklist { }'
+        printf '%s\n' '    chain ops_whitelist { }'
+        printf '%s\n' '    chain ops_rate_limit { }'
+        printf '%s\n' '    chain ops_ports { }'
+        printf '%s\n' '    chain ops_forward { }'
+        printf '%s\n' '    chain input {'
+        printf '%s\n' '        type filter hook input priority 0; policy drop;'
+        printf '%s\n' '        iifname "lo" accept'
+        printf '%s\n' '        ct state established,related accept'
+        printf '%s\n' '        ct state invalid drop'
+        printf '%s\n' '        jump ops_blacklist'
+        printf '%s\n' '        jump ops_whitelist'
+        printf '%s\n' '        ip protocol icmp limit rate 10/second accept'
+        printf '%s\n' '        ip6 nexthdr icmpv6 limit rate 10/second accept'
+        printf '%s\n' '        jump ops_rate_limit'
+        printf '%s\n' '        jump ops_ports'
+        printf '        tcp dport %s accept\n' "$ssh_port"
+        if [ "$enable_web" = true ]; then
+            printf '%s\n' '        tcp dport { 80, 443 } accept'
+        fi
+        printf '%s\n' '        limit rate 5/minute log prefix "nftables-drop: " level warn'
+        printf '%s\n' '    }'
+        printf '%s\n' '    chain forward {'
+        printf '%s\n' '        type filter hook forward priority 0; policy drop;'
+        printf '%s\n' '        ct state established,related accept'
+        printf '%s\n' '        jump ops_forward'
+        printf '%s\n' '    }'
+        printf '%s\n' '    chain output {'
+        printf '%s\n' '        type filter hook output priority 0; policy accept;'
+        printf '%s\n' '    }'
+        printf '%s\n' '}'
+        printf '%s\n' 'table ip ops_nat {'
+        printf '%s\n' '    chain prerouting {'
+        printf '%s\n' '        type nat hook prerouting priority dstnat; policy accept;'
+        printf '%s\n' '    }'
+        printf '%s\n' '    chain postrouting {'
+        printf '%s\n' '        type nat hook postrouting priority srcnat; policy accept;'
+        printf '%s\n' '    }'
+        printf '%s\n' '}'
+    } > "$output"
+}
+
+_fw_write_main_conf() {
+    local output="$1"
+    {
+        printf '%s\n' '#!/usr/sbin/nft -f' '' 'flush ruleset'
+        printf '%s\n' 'include "/etc/nftables.d/base.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/custom_ports.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/ip_whitelist.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/temp_whitelist.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/ip_blacklist.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/rate_limit.conf"'
+        printf '%s\n' 'include "/etc/nftables.d/port_forward.conf"'
+    } > "$output"
+}
+
+_fw_empty_rule_file() {
+    local output="$1" description="$2"
+    printf '#!/usr/sbin/nft -f\n# %s - 由 ops-scripts 管理\n' "$description" > "$output"
+}
+
+_fw_build_validation_bundle() {
+    local output="$1" candidate="${2:-}" target="${3:-}" file
+    printf 'flush ruleset\n' > "$output"
+
+    if [ "$target" = "$NFTABLES_BASE_CONF" ]; then
+        cat "$candidate" >> "$output"
+    elif [ -f "$NFTABLES_BASE_CONF" ]; then
+        cat "$NFTABLES_BASE_CONF" >> "$output"
+    else
+        return 1
+    fi
+
+    local -a managed_files=(
+        "${NFTABLES_DIR}/custom_ports.conf"
+        "${NFTABLES_DIR}/ip_whitelist.conf"
+        "${NFTABLES_DIR}/temp_whitelist.conf"
+        "${NFTABLES_DIR}/ip_blacklist.conf"
+        "${NFTABLES_DIR}/rate_limit.conf"
+        "${NFTABLES_DIR}/port_forward.conf"
+    )
+    for file in "${managed_files[@]}"; do
+        if [ "$file" = "$target" ]; then
+            cat "$candidate" >> "$output"
+        elif [ -f "$file" ]; then
+            cat "$file" >> "$output"
+        fi
+    done
+}
+
+_fw_validate_bundle() {
+    local candidate="${1:-}" target="${2:-}" bundle
+    bundle=$(mktemp "${NFTABLES_DIR}/.validate.XXXXXX") || return 1
+    if ! _fw_build_validation_bundle "$bundle" "$candidate" "$target"; then
+        rm -f "$bundle"
+        return 1
+    fi
+    if nft -c -f "$bundle" 2>/dev/null; then
+        rm -f "$bundle"
+        return 0
+    fi
+    log_error "规则验证失败:"
+    nft -c -f "$bundle" || true
+    rm -f "$bundle"
+    return 1
+}
+
+_fw_apply_candidate() {
+    local candidate="$1" target="$2" backup existed=false
+    [ -f "$candidate" ] || return 1
+    if ! _fw_validate_bundle "$candidate" "$target"; then
+        return 1
+    fi
+
+    backup=$(mktemp "${NFTABLES_DIR}/.backup.XXXXXX") || return 1
+    if [ -f "$target" ]; then
+        cp -p -- "$target" "$backup"
+        existed=true
+    fi
+    chmod 0644 "$candidate"
+    if ! mv -f -- "$candidate" "$target"; then
+        rm -f "$backup"
+        return 1
+    fi
+
+    if systemctl restart nftables; then
+        rm -f "$backup"
+        return 0
+    fi
+
+    log_error "防火墙重载失败，正在恢复上一份规则"
+    if [ "$existed" = true ]; then
+        mv -f -- "$backup" "$target"
+    else
+        rm -f -- "$target" "$backup"
+    fi
+    if ! systemctl restart nftables; then
+        log_error "旧规则恢复后仍无法重载，请保持当前连接并立即人工检查 nftables"
+    fi
+    return 1
+}
+
+_fw_new_candidate() {
+    local target="$1" description="$2" candidate
+    candidate=$(mktemp "${NFTABLES_DIR}/.candidate.XXXXXX") || return 1
+    if [ -f "$target" ]; then
+        cp -p -- "$target" "$candidate"
+    else
+        _fw_empty_rule_file "$candidate" "$description"
+    fi
+    printf '%s' "$candidate"
+}
+
+_fw_append_rule() {
+    local target="$1" description="$2" rule="$3" candidate
+    candidate=$(_fw_new_candidate "$target" "$description") || return 1
+    printf '%s\n' "$rule" >> "$candidate"
+    if _fw_apply_candidate "$candidate" "$target"; then
+        return 0
+    fi
+    rm -f "$candidate"
+    return 1
+}
+
+_fw_delete_rule_by_line() {
+    local target="$1" line_num="$2" expected_pattern="$3" candidate selected
+    [[ "$line_num" =~ ^[0-9]+$ ]] || return 1
+    selected=$(sed -n "${line_num}p" "$target")
+    if ! [[ "$selected" =~ $expected_pattern ]]; then
+        log_error "指定行不是此功能管理的规则，拒绝删除"
+        return 1
+    fi
+    candidate=$(_fw_new_candidate "$target" "防火墙规则") || return 1
+    sed -i "${line_num}d" "$candidate"
+    if _fw_apply_candidate "$candidate" "$target"; then
+        return 0
+    fi
+    rm -f "$candidate"
+    return 1
+}
+
+_fw_rollback_forward_rule() {
+    local conf_file="$1" rule_id="$2" candidate
+    candidate=$(_fw_new_candidate "$conf_file" "端口转发规则") || return 1
+    sed -i "/# ops-forward:${rule_id}$/d" "$candidate"
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
+        return 0
+    fi
+    rm -f "$candidate"
+    return 1
+}
+
+_fw_restore_ip_forward_conf() {
+    local backup="$1" existed="$2"
+    if [ "$existed" = true ]; then
+        mv -f -- "$backup" "$IP_FORWARD_CONF"
+    else
+        rm -f -- "$IP_FORWARD_CONF" "$backup"
+    fi
+}
+
+_fw_restore_ip_forward_runtime() {
+    local old_value="$1"
+    if [[ "$old_value" =~ ^[01]$ ]]; then
+        sysctl -w "net.ipv4.ip_forward=${old_value}" >/dev/null 2>&1 || true
+    fi
+}
+
+_fw_install_layout() {
+    local ssh_port="$1" enable_web="$2" base_candidate main_candidate
+    local base_backup main_backup base_existed=false main_existed=false
+    local -a created_rule_files=()
+    base_candidate=$(mktemp "${NFTABLES_DIR}/.base.XXXXXX") || return 1
+    main_candidate=$(mktemp "$(dirname "$NFTABLES_MAIN_CONF")/.nft-main.XXXXXX") || {
+        rm -f "$base_candidate"
+        return 1
+    }
+    _fw_write_base_conf "$base_candidate" "$ssh_port" "$enable_web"
+    _fw_write_main_conf "$main_candidate"
+    if ! _fw_validate_bundle "$base_candidate" "$NFTABLES_BASE_CONF"; then
+        rm -f "$base_candidate" "$main_candidate"
+        return 1
+    fi
+
+    base_backup=$(mktemp "${NFTABLES_DIR}/.base-backup.XXXXXX") || return 1
+    main_backup=$(mktemp "$(dirname "$NFTABLES_MAIN_CONF")/.main-backup.XXXXXX") || return 1
+    if [ -f "$NFTABLES_BASE_CONF" ]; then
+        cp -p -- "$NFTABLES_BASE_CONF" "$base_backup"
+        base_existed=true
+    fi
+    if [ -f "$NFTABLES_MAIN_CONF" ]; then
+        cp -p -- "$NFTABLES_MAIN_CONF" "$main_backup"
+        main_existed=true
+    fi
+    chmod 0644 "$base_candidate" "$main_candidate"
+    mv -f -- "$base_candidate" "$NFTABLES_BASE_CONF"
+    mv -f -- "$main_candidate" "$NFTABLES_MAIN_CONF"
+    local name file
+    for name in custom_ports.conf ip_whitelist.conf temp_whitelist.conf ip_blacklist.conf rate_limit.conf port_forward.conf; do
+        file="${NFTABLES_DIR}/${name}"
+        if [ ! -f "$file" ]; then
+            _fw_empty_rule_file "$file" "防火墙规则"
+            chmod 0644 "$file"
+            created_rule_files+=("$file")
+        fi
+    done
+    if systemctl restart nftables; then
+        rm -f "$base_backup" "$main_backup"
+        return 0
+    fi
+
+    log_error "新防火墙规则加载失败，正在回滚"
+    if [ "$base_existed" = true ]; then mv -f -- "$base_backup" "$NFTABLES_BASE_CONF"; else rm -f "$NFTABLES_BASE_CONF" "$base_backup"; fi
+    if [ "$main_existed" = true ]; then mv -f -- "$main_backup" "$NFTABLES_MAIN_CONF"; else rm -f "$NFTABLES_MAIN_CONF" "$main_backup"; fi
+    for file in "${created_rule_files[@]}"; do rm -f -- "$file"; done
+    systemctl restart nftables || log_error "旧规则恢复后仍无法重载，请立即人工检查"
+    return 1
+}
+
+_fw_replace_managed_rules() {
+    local base_source="$1" staging backup file staged_file
+    local -a managed_names=(base.conf custom_ports.conf ip_whitelist.conf temp_whitelist.conf ip_blacklist.conf rate_limit.conf port_forward.conf)
+    staging=$(mktemp -d "${NFTABLES_DIR}/.replace.XXXXXX") || return 1
+    backup=$(mktemp -d "${NFTABLES_DIR}/.replace-backup.XXXXXX") || { rm -rf "$staging"; return 1; }
+
+    if grep -Eq '(^|[[:space:]])flush[[:space:]]+ruleset([[:space:]]|$)|(^|[[:space:]])include[[:space:]]' "$base_source"; then
+        log_error "导入规则不得包含 flush ruleset 或 include；请提供单个自包含 ruleset"
+        rm -rf "$staging" "$backup"
+        return 1
+    fi
+    cp -- "$base_source" "${staging}/base.conf"
+    local name
+    for name in "${managed_names[@]:1}"; do
+        _fw_empty_rule_file "${staging}/${name}" "防火墙规则"
+    done
+
+    local bundle
+    bundle=$(mktemp "${NFTABLES_DIR}/.replace-validate.XXXXXX") || { rm -rf "$staging" "$backup"; return 1; }
+    printf 'flush ruleset\n' > "$bundle"
+    for name in "${managed_names[@]}"; do cat "${staging}/${name}" >> "$bundle"; done
+    if ! nft -c -f "$bundle" 2>/dev/null; then
+        log_error "候选规则未通过 nft 验证"
+        nft -c -f "$bundle" || true
+        rm -f "$bundle"
+        rm -rf "$staging" "$backup"
+        return 1
+    fi
+    rm -f "$bundle"
+
+    for name in "${managed_names[@]}"; do
+        file="${NFTABLES_DIR}/${name}"
+        if [ -f "$file" ]; then cp -p -- "$file" "${backup}/${name}"; fi
+        chmod 0644 "${staging}/${name}"
+        mv -f -- "${staging}/${name}" "$file"
+    done
+    if systemctl restart nftables; then
+        rm -rf "$staging" "$backup"
+        return 0
+    fi
+
+    log_error "候选规则加载失败，正在恢复全部受管规则"
+    for name in "${managed_names[@]}"; do
+        file="${NFTABLES_DIR}/${name}"
+        if [ -f "${backup}/${name}" ]; then
+            mv -f -- "${backup}/${name}" "$file"
+        else
+            rm -f -- "$file"
+        fi
+    done
+    systemctl restart nftables || log_error "旧规则恢复后仍无法重载，请立即人工检查"
+    rm -rf "$staging" "$backup"
+    return 1
+}
+
+_fw_migrate_legacy_layout() {
+    if grep -q '^# OPS-SCRIPTS FIREWALL BASE v2$' "$NFTABLES_BASE_CONF" 2>/dev/null; then
+        return 0
+    fi
+
+    log_warn "检测到旧版 nftables 规则布局，将在完整验证后原子迁移"
+    local staging backup name line trimmed ssh_port web=false family address proto ports rate target target_port source_port rule_id
+    local -a names=(base.conf custom_ports.conf ip_whitelist.conf temp_whitelist.conf ip_blacklist.conf rate_limit.conf port_forward.conf)
+    staging=$(mktemp -d "${NFTABLES_DIR}/.migrate.XXXXXX") || return 1
+    backup=$(mktemp -d "${NFTABLES_DIR}/.migrate-backup.XXXXXX") || { rm -rf "$staging"; return 1; }
+    ssh_port=$(get_ssh_port)
+    _fw_validate_single_port "$ssh_port" || { log_error "SSH 端口无效，无法安全迁移"; rm -rf "$staging" "$backup"; return 1; }
+    if grep -q 'tcp dport { 80, 443 } accept' "$NFTABLES_BASE_CONF" 2>/dev/null; then web=true; fi
+    _fw_write_base_conf "${staging}/base.conf" "$ssh_port" "$web"
+    for name in "${names[@]:1}"; do _fw_empty_rule_file "${staging}/${name}" "防火墙规则"; done
+
+    if [ -f "${NFTABLES_DIR}/custom_ports.conf" ]; then
+        while IFS= read -r line; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$trimmed" =~ ^((ip6?|ip)[[:space:]]+saddr[[:space:]]+([^[:space:]]+)[[:space:]]+)?(tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+(-[0-9]+)?)[[:space:]]+accept ]]; then
+                family="${BASH_REMATCH[2]}"; address="${BASH_REMATCH[3]}"; proto="${BASH_REMATCH[4]}"; ports="${BASH_REMATCH[5]}"
+                if [ -n "$family" ]; then
+                    printf 'add rule inet ops_filter ops_ports %s saddr %s %s dport %s accept # ops-port\n' "$family" "$address" "$proto" "$ports" >> "${staging}/custom_ports.conf"
+                else
+                    printf 'add rule inet ops_filter ops_ports %s dport %s accept # ops-port\n' "$proto" "$ports" >> "${staging}/custom_ports.conf"
+                fi
+            fi
+        done < "${NFTABLES_DIR}/custom_ports.conf"
+    fi
+
+    for name in ip_whitelist ip_blacklist; do
+        if [ -f "${NFTABLES_DIR}/${name}.conf" ]; then
+            while IFS= read -r line; do
+                trimmed="${line#"${line%%[![:space:]]*}"}"
+                if [[ "$trimmed" =~ ^(ip6?|ip)[[:space:]]+saddr[[:space:]]+([^[:space:]]+)[[:space:]]+(accept|drop) ]]; then
+                    family="${BASH_REMATCH[1]}"; address="${BASH_REMATCH[2]}"
+                    if [ "$name" = ip_whitelist ]; then
+                        printf 'add rule inet ops_filter ops_whitelist %s saddr %s accept # ops-whitelist\n' "$family" "$address" >> "${staging}/${name}.conf"
+                    else
+                        printf 'add rule inet ops_filter ops_blacklist %s saddr %s drop # ops-blacklist\n' "$family" "$address" >> "${staging}/${name}.conf"
+                    fi
+                fi
+            done < "${NFTABLES_DIR}/${name}.conf"
+        fi
+    done
+
+    if [ -f "${NFTABLES_DIR}/rate_limit.conf" ]; then
+        while IFS= read -r line; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$trimmed" =~ ^tcp[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+limit[[:space:]]+rate[[:space:]]+([^[:space:]]+)[[:space:]]+accept ]]; then
+                ports="${BASH_REMATCH[1]}"; rate="${BASH_REMATCH[2]}"; rule_id="migrated-${ports}-${RANDOM}"
+                printf 'add rule inet ops_filter ops_rate_limit tcp dport %s limit rate %s accept # ops-rate:%s\n' "$ports" "$rate" "$rule_id" >> "${staging}/rate_limit.conf"
+                printf 'add rule inet ops_filter ops_rate_limit tcp dport %s drop # ops-rate:%s\n' "$ports" "$rule_id" >> "${staging}/rate_limit.conf"
+            fi
+        done < "${NFTABLES_DIR}/rate_limit.conf"
+    fi
+
+    if [ -f "${NFTABLES_DIR}/port_forward.conf" ]; then
+        while IFS= read -r line; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$trimmed" =~ ^(tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+dnat[[:space:]]+to[[:space:]]+([0-9.]+):([0-9]+) ]]; then
+                proto="${BASH_REMATCH[1]}"; source_port="${BASH_REMATCH[2]}"; target="${BASH_REMATCH[3]}"; target_port="${BASH_REMATCH[4]}"; rule_id="migrated-${source_port}-${RANDOM}"
+                printf 'add rule ip ops_nat prerouting %s dport %s dnat to %s:%s # ops-forward:%s\n' "$proto" "$source_port" "$target" "$target_port" "$rule_id" >> "${staging}/port_forward.conf"
+                printf 'add rule inet ops_filter ops_forward ip daddr %s %s dport %s accept # ops-forward:%s\n' "$target" "$proto" "$target_port" "$rule_id" >> "${staging}/port_forward.conf"
+                printf 'add rule ip ops_nat postrouting ip daddr %s %s dport %s masquerade # ops-forward:%s\n' "$target" "$proto" "$target_port" "$rule_id" >> "${staging}/port_forward.conf"
+            fi
+        done < "${NFTABLES_DIR}/port_forward.conf"
+    fi
+
+    if [ -f "$TEMP_WHITELIST_DATA" ]; then
+        _render_temp_whitelist_conf "$TEMP_WHITELIST_DATA" "${staging}/temp_whitelist.conf" || { rm -rf "$staging" "$backup"; return 1; }
+    fi
+
+    local bundle main_candidate main_backup main_existed=false file
+    bundle=$(mktemp "${NFTABLES_DIR}/.migrate-validate.XXXXXX") || return 1
+    printf 'flush ruleset\n' > "$bundle"
+    for name in "${names[@]}"; do cat "${staging}/${name}" >> "$bundle"; done
+    if ! nft -c -f "$bundle" 2>/dev/null; then
+        log_error "旧规则迁移结果未通过验证，未修改现有配置"
+        nft -c -f "$bundle" || true
+        rm -f "$bundle"; rm -rf "$staging" "$backup"; return 1
+    fi
+    rm -f "$bundle"
+    main_candidate=$(mktemp "$(dirname "$NFTABLES_MAIN_CONF")/.migrate-main.XXXXXX") || return 1
+    _fw_write_main_conf "$main_candidate"
+    main_backup=$(mktemp "$(dirname "$NFTABLES_MAIN_CONF")/.migrate-main-backup.XXXXXX") || return 1
+    if [ -f "$NFTABLES_MAIN_CONF" ]; then cp -p -- "$NFTABLES_MAIN_CONF" "$main_backup"; main_existed=true; fi
+    for name in "${names[@]}"; do
+        file="${NFTABLES_DIR}/${name}"
+        [ -f "$file" ] && cp -p -- "$file" "${backup}/${name}"
+        chmod 0644 "${staging}/${name}"
+        mv -f -- "${staging}/${name}" "$file"
+    done
+    chmod 0644 "$main_candidate"; mv -f -- "$main_candidate" "$NFTABLES_MAIN_CONF"
+    if systemctl restart nftables; then
+        rm -rf "$staging" "$backup"; rm -f "$main_backup"
+        log_info "旧版防火墙规则已迁移到安全链路"
+        return 0
+    fi
+    log_error "迁移规则加载失败，正在恢复旧配置"
+    for name in "${names[@]}"; do
+        file="${NFTABLES_DIR}/${name}"
+        if [ -f "${backup}/${name}" ]; then mv -f -- "${backup}/${name}" "$file"; else rm -f -- "$file"; fi
+    done
+    if [ "$main_existed" = true ]; then mv -f -- "$main_backup" "$NFTABLES_MAIN_CONF"; else rm -f "$NFTABLES_MAIN_CONF" "$main_backup"; fi
+    systemctl restart nftables || log_error "旧配置恢复后仍无法重载，请立即人工检查"
+    rm -rf "$staging" "$backup"
+    return 1
+}
 
 # ============================================================
 # 防火墙初始化
@@ -30,23 +540,19 @@ firewall_init() {
 
     detect_os
 
-    # 如果是 Ubuntu，关闭 ufw
-    if [ "$OS_ID" = "ubuntu" ]; then
-        log_step "检测到 Ubuntu 系统，正在关闭 ufw..."
-        ufw disable 2>/dev/null
-        systemctl stop ufw 2>/dev/null
-        systemctl disable ufw 2>/dev/null
-        log_info "ufw 已关闭并禁用"
-    fi
-
     # 确保 nftables 已安装
     if ! command -v nft &>/dev/null; then
         log_step "正在安装 nftables..."
-        apt install -y nftables
+        if ! apt install -y nftables; then
+            log_error "nftables 安装失败"
+            return 1
+        fi
     fi
 
-    # 启用 nftables
-    systemctl enable nftables
+    if ! systemctl enable nftables; then
+        log_error "无法启用 nftables 服务"
+        return 1
+    fi
     log_info "nftables 服务已启用"
 
     # 创建规则目录
@@ -55,105 +561,64 @@ firewall_init() {
     # 获取当前 SSH 端口
     local ssh_port
     ssh_port=$(get_ssh_port)
+    if ! _fw_validate_single_port "$ssh_port"; then
+        log_error "检测到无效 SSH 端口: ${ssh_port}"
+        return 1
+    fi
     log_info "当前 SSH 端口: ${ssh_port}"
 
     # 询问是否开放 Web 端口
-    local web_ports=""
+    local enable_web=false
     if confirm "是否开放 Web 端口 (80 和 443)?"; then
-        web_ports="        tcp dport { 80, 443 } accept"
+        enable_web=true
     fi
 
-    # 生成基础规则文件
-    log_step "正在生成基础防火墙规则..."
-    cat > "$NFTABLES_BASE_CONF" << EOF
-#!/usr/sbin/nft -f
-# ============================================================
-# 基础防火墙规则 - 由 ops-scripts 自动生成
-# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-# ============================================================
+    if [ -f "$NFTABLES_BASE_CONF" ] \
+        && ! grep -q '^# OPS-SCRIPTS FIREWALL BASE v2$' "$NFTABLES_BASE_CONF"; then
+        if ! _fw_migrate_legacy_layout; then
+            log_error "已有旧版规则无法安全迁移，防火墙初始化已取消"
+            return 1
+        fi
+    fi
 
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-
-        # 允许本地回环
-        iif "lo" accept
-
-        # 允许已建立和相关连接
-        ct state established,related accept
-
-        # 丢弃无效连接
-        ct state invalid drop
-
-        # 允许 ICMP (ping)
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-
-        # 允许 SSH 端口
-        tcp dport ${ssh_port} accept
-
-${web_ports}
-
-        # 限制 ICMP 速率防止 flood
-        ip protocol icmp limit rate 10/second accept
-
-        # 记录被拒绝的连接（限制日志速率）
-        limit rate 5/minute log prefix "nftables-drop: " level warn
-
-        # 默认丢弃
-        drop
-    }
-
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-
-        # 允许已建立和相关连接的转发
-        ct state established,related accept
-    }
-
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-EOF
-
-    # 设置主配置文件
-    cat > "$NFTABLES_MAIN_CONF" << 'EOF'
-#!/usr/sbin/nft -f
-
-# 清空所有规则
-flush ruleset
-
-# 加载所有规则文件
-include "/etc/nftables.d/*.conf"
-EOF
-
-    # 验证规则
-    log_step "验证防火墙规则..."
-    if nft -c -f "$NFTABLES_MAIN_CONF" 2>/dev/null; then
-        log_info "防火墙规则验证通过"
-    else
-        log_error "防火墙规则验证失败:"
-        nft -c -f "$NFTABLES_MAIN_CONF"
-        log_warn "请检查规则文件"
+    # 先生成并验证候选规则，再处理可能与 nftables 冲突的 ufw。
+    log_step "正在生成并预检基础防火墙规则..."
+    local preflight_candidate
+    preflight_candidate=$(mktemp "${NFTABLES_DIR}/.base-preflight.XXXXXX") || return 1
+    _fw_write_base_conf "$preflight_candidate" "$ssh_port" "$enable_web"
+    if ! _fw_validate_bundle "$preflight_candidate" "$NFTABLES_BASE_CONF"; then
+        rm -f "$preflight_candidate"
+        log_error "候选防火墙规则未通过验证，现有防火墙未变更"
         return 1
     fi
+    rm -f "$preflight_candidate"
 
-    # 重启防火墙
-    log_step "正在应用防火墙规则..."
-    systemctl restart nftables
-    if [ $? -eq 0 ]; then
-        log_info "防火墙已启动并应用规则"
-    else
-        log_error "防火墙启动失败"
+    local ufw_was_active=false
+    if [ "$OS_ID" = "ubuntu" ] && command -v ufw &>/dev/null; then
+        if systemctl is-active ufw >/dev/null 2>&1; then ufw_was_active=true; fi
+        log_step "检测到 Ubuntu，正在停用可能冲突的 ufw..."
+        if ! ufw disable >/dev/null 2>&1; then
+            log_error "无法停用 ufw，拒绝加载第二套防火墙以避免规则冲突"
+            return 1
+        fi
+        systemctl disable --now ufw >/dev/null 2>&1 || log_warn "ufw 已停用，但无法禁用其 systemd 单元"
+    fi
+
+    if ! _fw_install_layout "$ssh_port" "$enable_web"; then
+        log_error "防火墙规则安装失败，原配置已保留或恢复"
+        if [ "$ufw_was_active" = true ]; then
+            log_warn "正在尝试恢复此前启用的 ufw"
+            ufw --force enable >/dev/null 2>&1 || log_error "ufw 恢复失败，请保持当前连接并立即人工检查"
+        fi
         return 1
     fi
+    log_info "防火墙规则已验证并应用"
 
     # 显示当前规则
     echo ""
     log_info "当前防火墙规则:"
     print_thin_separator
-    nft list ruleset
+    nft list ruleset || log_warn "无法读取当前 nftables 规则"
     print_thin_separator
 
     # 标记已初始化
@@ -221,7 +686,7 @@ firewall_modify() {
 fw_show_rules() {
     log_step "当前防火墙规则:"
     print_thin_separator
-    nft list ruleset
+    nft list ruleset || log_error "无法读取当前 nftables 规则"
     print_thin_separator
 }
 
@@ -239,10 +704,13 @@ fw_add_port() {
 
     local port
     read_nonempty "请输入端口号或端口范围 (如: 8080 或 8000-9000)" port
+    if ! _fw_validate_port "$port"; then
+        log_error "端口必须在 1-65535，且范围起始值不得大于结束值"
+        return 1
+    fi
 
-    # 验证端口格式
-    if ! echo "$port" | grep -qE '^[0-9]+(-[0-9]+)?$'; then
-        log_error "端口格式不正确"
+    if ! _fw_migrate_legacy_layout; then
+        log_error "旧版防火墙规则迁移失败，已保留原配置；拒绝继续修改"
         return 1
     fi
 
@@ -251,52 +719,35 @@ fw_add_port() {
     echo "  1) 任意来源"
     echo "  2) 指定 IP 或网段"
     select_option "选择" 2
-    local src_filter=""
+    local src_filter="" family
     if [ "$SELECTED_OPTION" -eq 2 ]; then
         local src_ip
         read_nonempty "请输入源 IP 或网段 (如: 192.168.1.0/24)" src_ip
-        src_filter="ip saddr ${src_ip} "
+        if ! _fw_validate_ip_cidr "$src_ip"; then
+            log_error "无效的 IP 地址或 CIDR"
+            return 1
+        fi
+        family=$(_fw_address_family_keyword "$src_ip")
+        src_filter="${family} saddr ${src_ip} "
     fi
 
     local conf_file="${NFTABLES_DIR}/custom_ports.conf"
-
-    # 如果文件不存在，创建框架
-    if [ ! -f "$conf_file" ]; then
-        cat > "$conf_file" << 'EOF'
-#!/usr/sbin/nft -f
-# 自定义端口放行规则
-table inet custom_ports {
-    chain input {
-        type filter hook input priority -1; policy accept;
-    }
-}
-EOF
-    fi
-
-    local rules=""
+    local candidate
+    candidate=$(_fw_new_candidate "$conf_file" "自定义端口放行规则") || return 1
     case "$proto_choice" in
-        1)
-            rules="        ${src_filter}tcp dport ${port} accept  # added $(date '+%Y-%m-%d %H:%M')"
-            ;;
-        2)
-            rules="        ${src_filter}udp dport ${port} accept  # added $(date '+%Y-%m-%d %H:%M')"
-            ;;
+        1) printf 'add rule inet ops_filter ops_ports %stcp dport %s accept # ops-port\n' "$src_filter" "$port" >> "$candidate" ;;
+        2) printf 'add rule inet ops_filter ops_ports %sudp dport %s accept # ops-port\n' "$src_filter" "$port" >> "$candidate" ;;
         3)
-            rules="        ${src_filter}tcp dport ${port} accept  # added $(date '+%Y-%m-%d %H:%M')\n        ${src_filter}udp dport ${port} accept  # added $(date '+%Y-%m-%d %H:%M')"
+            printf 'add rule inet ops_filter ops_ports %stcp dport %s accept # ops-port\n' "$src_filter" "$port" >> "$candidate"
+            printf 'add rule inet ops_filter ops_ports %sudp dport %s accept # ops-port\n' "$src_filter" "$port" >> "$candidate"
             ;;
     esac
-
-    # 在 chain input 的最后一个 } 前插入规则
-    sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
-$(echo -e "$rules")
-}" "$conf_file"
-
-    if _fw_validate_and_reload; then
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
         log_info "端口放行规则已添加: ${port}"
     else
-        log_error "规则添加失败，正在回滚..."
-        rm -f "$conf_file"
-        fw_reload
+        rm -f "$candidate"
+        log_error "规则添加失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -313,23 +764,21 @@ fw_delete_port() {
 
     log_info "当前自定义端口规则:"
     print_thin_separator
-    grep -n "dport.*accept" "$conf_file" | while IFS= read -r line; do
-        echo "  $line"
-    done
+    grep -n '# ops-port$' "$conf_file" || true
     print_thin_separator
 
     local line_num
     read_nonempty "请输入要删除的规则行号" line_num
 
-    if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-        sed -i "${line_num}d" "$conf_file"
-        if _fw_validate_and_reload; then
-            log_info "规则已删除"
-        else
-            log_error "删除规则后验证失败"
-        fi
-    else
+    if ! [[ "$line_num" =~ ^[0-9]+$ ]]; then
         log_error "无效的行号"
+        return 1
+    fi
+    if _fw_delete_rule_by_line "$conf_file" "$line_num" '# ops-port$'; then
+        log_info "规则已删除"
+    else
+        log_error "规则删除失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -340,26 +789,20 @@ fw_add_ip_whitelist() {
 
     local ip
     read_nonempty "请输入要放行的 IP 地址或网段 (如: 10.0.0.1 或 192.168.0.0/24)" ip
-
-    local conf_file="${NFTABLES_DIR}/ip_whitelist.conf"
-    if [ ! -f "$conf_file" ]; then
-        cat > "$conf_file" << 'EOF'
-#!/usr/sbin/nft -f
-# IP 白名单规则
-table inet ip_whitelist {
-    chain input {
-        type filter hook input priority -10; policy accept;
-    }
-}
-EOF
+    if ! _fw_validate_ip_cidr "$ip"; then
+        log_error "无效的 IP 地址或 CIDR"
+        return 1
     fi
 
-    sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
-        ip saddr ${ip} accept  # whitelist $(date '+%Y-%m-%d %H:%M')
-}" "$conf_file"
-
-    if _fw_validate_and_reload; then
+    local conf_file="${NFTABLES_DIR}/ip_whitelist.conf"
+    local family
+    family=$(_fw_address_family_keyword "$ip")
+    if _fw_append_rule "$conf_file" "IP 白名单规则" \
+        "add rule inet ops_filter ops_whitelist ${family} saddr ${ip} accept # ops-whitelist"; then
         log_info "IP 白名单已添加: ${ip}"
+    else
+        log_error "添加失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -376,20 +819,20 @@ fw_delete_ip_whitelist() {
 
     log_info "当前 IP 白名单:"
     print_thin_separator
-    grep -n "saddr.*accept.*whitelist" "$conf_file" | while IFS= read -r line; do
-        echo "  $line"
-    done
+    grep -n '# ops-whitelist$' "$conf_file" || true
     print_thin_separator
 
     local line_num
     read_nonempty "请输入要删除的规则行号" line_num
-    if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-        sed -i "${line_num}d" "$conf_file"
-        if _fw_validate_and_reload; then
-            log_info "IP 白名单规则已删除"
-        fi
-    else
+    if ! [[ "$line_num" =~ ^[0-9]+$ ]]; then
         log_error "无效的行号"
+        return 1
+    fi
+    if _fw_delete_rule_by_line "$conf_file" "$line_num" '# ops-whitelist$'; then
+        log_info "IP 白名单规则已删除"
+    else
+        log_error "删除失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -400,26 +843,20 @@ fw_add_ip_blacklist() {
 
     local ip
     read_nonempty "请输入要封禁的 IP 地址或网段" ip
-
-    local conf_file="${NFTABLES_DIR}/ip_blacklist.conf"
-    if [ ! -f "$conf_file" ]; then
-        cat > "$conf_file" << 'EOF'
-#!/usr/sbin/nft -f
-# IP 黑名单规则
-table inet ip_blacklist {
-    chain input {
-        type filter hook input priority -20; policy accept;
-    }
-}
-EOF
+    if ! _fw_validate_ip_cidr "$ip"; then
+        log_error "无效的 IP 地址或 CIDR"
+        return 1
     fi
 
-    sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
-        ip saddr ${ip} drop  # blacklist $(date '+%Y-%m-%d %H:%M')
-}" "$conf_file"
-
-    if _fw_validate_and_reload; then
+    local conf_file="${NFTABLES_DIR}/ip_blacklist.conf"
+    local family
+    family=$(_fw_address_family_keyword "$ip")
+    if _fw_append_rule "$conf_file" "IP 黑名单规则" \
+        "add rule inet ops_filter ops_blacklist ${family} saddr ${ip} drop # ops-blacklist"; then
         log_info "IP 已封禁: ${ip}"
+    else
+        log_error "封禁失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -436,20 +873,20 @@ fw_delete_ip_blacklist() {
 
     log_info "当前 IP 黑名单:"
     print_thin_separator
-    grep -n "saddr.*drop.*blacklist" "$conf_file" | while IFS= read -r line; do
-        echo "  $line"
-    done
+    grep -n '# ops-blacklist$' "$conf_file" || true
     print_thin_separator
 
     local line_num
     read_nonempty "请输入要删除的规则行号" line_num
-    if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-        sed -i "${line_num}d" "$conf_file"
-        if _fw_validate_and_reload; then
-            log_info "IP 黑名单规则已删除"
-        fi
-    else
+    if ! [[ "$line_num" =~ ^[0-9]+$ ]]; then
         log_error "无效的行号"
+        return 1
+    fi
+    if _fw_delete_rule_by_line "$conf_file" "$line_num" '# ops-blacklist$'; then
+        log_info "IP 黑名单规则已删除"
+    else
+        log_error "删除失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -463,43 +900,77 @@ fw_add_port_forward() {
     echo "  2) UDP"
     select_option "协议" 2
     local proto
-    [ "$SELECTED_OPTION" -eq 1 ] && proto="tcp" || proto="udp"
+    if [ "$SELECTED_OPTION" -eq 1 ]; then proto="tcp"; else proto="udp"; fi
 
     local src_port dest_ip dest_port
     read_nonempty "请输入源端口" src_port
     read_nonempty "请输入目标 IP" dest_ip
     read_nonempty "请输入目标端口" dest_port
+    if ! _fw_validate_single_port "$src_port" || ! _fw_validate_single_port "$dest_port"; then
+        log_error "源端口和目标端口必须为 1-65535 的单个端口"
+        return 1
+    fi
+    if ! _fw_validate_ipv4 "$dest_ip" || [[ "$dest_ip" == */* ]]; then
+        log_error "端口转发目标必须为单个 IPv4 地址"
+        return 1
+    fi
 
     local conf_file="${NFTABLES_DIR}/port_forward.conf"
-    if [ ! -f "$conf_file" ]; then
-        cat > "$conf_file" << 'EOF'
-#!/usr/sbin/nft -f
-# 端口转发规则
-table inet port_forward {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-    }
+    local rule_id candidate
+    rule_id="$(date +%s)-${RANDOM}"
+    candidate=$(_fw_new_candidate "$conf_file" "端口转发规则") || return 1
+    printf 'add rule ip ops_nat prerouting %s dport %s dnat to %s:%s # ops-forward:%s\n' \
+        "$proto" "$src_port" "$dest_ip" "$dest_port" "$rule_id" >> "$candidate"
+    printf 'add rule inet ops_filter ops_forward ip daddr %s %s dport %s accept # ops-forward:%s\n' \
+        "$dest_ip" "$proto" "$dest_port" "$rule_id" >> "$candidate"
+    printf 'add rule ip ops_nat postrouting ip daddr %s %s dport %s masquerade # ops-forward:%s\n' \
+        "$dest_ip" "$proto" "$dest_port" "$rule_id" >> "$candidate"
 
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-        masquerade
-    }
-}
-EOF
-    fi
-
-    sed -i "/^    chain prerouting {/,/^    }/ { /^    }/i\\
-        ${proto} dport ${src_port} dnat to ${dest_ip}:${dest_port}  # forward $(date '+%Y-%m-%d %H:%M')
-}" "$conf_file"
-
-    # 启用 IP 转发
-    echo 1 > /proc/sys/net/ipv4/ip_forward
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
-
-    if _fw_validate_and_reload; then
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
+        local sysctl_candidate sysctl_backup ip_forward_existed=false previous_ip_forward
+        previous_ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)
+        sysctl_candidate=$(mktemp "$(dirname "$IP_FORWARD_CONF")/.ip-forward.XXXXXX") || {
+            log_error "无法创建 IP 转发配置候选，正在撤回防火墙规则"
+            _fw_rollback_forward_rule "$conf_file" "$rule_id" || log_error "自动撤回规则失败，请立即人工检查"
+            return 1
+        }
+        sysctl_backup=$(mktemp "$(dirname "$IP_FORWARD_CONF")/.ip-forward-backup.XXXXXX") || {
+            rm -f "$sysctl_candidate"
+            log_error "无法创建 IP 转发配置备份，正在撤回防火墙规则"
+            _fw_rollback_forward_rule "$conf_file" "$rule_id" || log_error "自动撤回规则失败，请立即人工检查"
+            return 1
+        }
+        if [ -f "$IP_FORWARD_CONF" ]; then
+            if ! cp -p -- "$IP_FORWARD_CONF" "$sysctl_backup"; then
+                rm -f "$sysctl_candidate" "$sysctl_backup"
+                log_error "无法备份原 IP 转发配置，正在撤回防火墙规则"
+                _fw_rollback_forward_rule "$conf_file" "$rule_id" || log_error "自动撤回规则失败，请立即人工检查"
+                return 1
+            fi
+            ip_forward_existed=true
+        fi
+        printf 'net.ipv4.ip_forward = 1\n' > "$sysctl_candidate"
+        chmod 0644 "$sysctl_candidate"
+        if ! mv -f -- "$sysctl_candidate" "$IP_FORWARD_CONF"; then
+            rm -f "$sysctl_candidate"
+            _fw_restore_ip_forward_conf "$sysctl_backup" "$ip_forward_existed"
+            log_error "无法安装 IP 转发配置，正在撤回防火墙规则"
+            _fw_rollback_forward_rule "$conf_file" "$rule_id" || log_error "自动撤回规则失败，请立即人工检查"
+            return 1
+        fi
+        if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null; then
+            log_error "无法启用 IPv4 转发，正在恢复配置并撤回防火墙规则"
+            _fw_restore_ip_forward_conf "$sysctl_backup" "$ip_forward_existed"
+            _fw_restore_ip_forward_runtime "$previous_ip_forward"
+            _fw_rollback_forward_rule "$conf_file" "$rule_id" || log_error "自动撤回规则失败，请立即人工检查"
+            return 1
+        fi
+        rm -f "$sysctl_backup"
         log_info "端口转发规则已添加: ${src_port} -> ${dest_ip}:${dest_port}"
+    else
+        rm -f "$candidate"
+        log_error "添加失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -516,20 +987,30 @@ fw_delete_port_forward() {
 
     log_info "当前端口转发规则:"
     print_thin_separator
-    grep -n "dnat to.*forward" "$conf_file" | while IFS= read -r line; do
-        echo "  $line"
-    done
+    grep -n 'ops-forward:' "$conf_file" | grep 'dnat to' || true
     print_thin_separator
 
-    local line_num
+    local line_num selected rule_id candidate
     read_nonempty "请输入要删除的规则行号" line_num
-    if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-        sed -i "${line_num}d" "$conf_file"
-        if _fw_validate_and_reload; then
-            log_info "端口转发规则已删除"
-        fi
-    else
+    if ! [[ "$line_num" =~ ^[0-9]+$ ]]; then
         log_error "无效的行号"
+        return 1
+    fi
+    selected=$(sed -n "${line_num}p" "$conf_file")
+    if [[ "$selected" =~ ops-forward:([A-Za-z0-9-]+)$ ]]; then
+        rule_id="${BASH_REMATCH[1]}"
+    else
+        log_error "指定行不是本工具管理的端口转发规则"
+        return 1
+    fi
+    candidate=$(_fw_new_candidate "$conf_file" "端口转发规则") || return 1
+    sed -i "/# ops-forward:${rule_id}$/d" "$candidate"
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
+        log_info "端口转发规则及其限定的转发/masquerade 规则已删除"
+    else
+        rm -f "$candidate"
+        log_error "删除失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -540,6 +1021,10 @@ fw_add_rate_limit() {
 
     local port rate
     read_nonempty "请输入要限制的端口号" port
+    if ! _fw_validate_single_port "$port"; then
+        log_error "端口必须为 1-65535 的单个端口"
+        return 1
+    fi
     echo ""
     echo "请选择限制速率:"
     echo "  1) 10/秒"
@@ -555,26 +1040,23 @@ fw_add_rate_limit() {
         4) rate="100/second" ;;
         5) read_nonempty "请输入速率 (格式: 数量/second|minute|hour)" rate ;;
     esac
-
-    local conf_file="${NFTABLES_DIR}/rate_limit.conf"
-    if [ ! -f "$conf_file" ]; then
-        cat > "$conf_file" << 'EOF'
-#!/usr/sbin/nft -f
-# 速率限制规则
-table inet rate_limit {
-    chain input {
-        type filter hook input priority -5; policy accept;
-    }
-}
-EOF
+    if ! _fw_validate_rate "$rate"; then
+        log_error "速率格式无效，应为正整数/second、/minute 或 /hour"
+        return 1
     fi
 
-    sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
-        tcp dport ${port} limit rate ${rate} accept  # ratelimit $(date '+%Y-%m-%d %H:%M')\\n        tcp dport ${port} drop
-}" "$conf_file"
-
-    if _fw_validate_and_reload; then
+    local conf_file="${NFTABLES_DIR}/rate_limit.conf"
+    local rule_id candidate
+    rule_id="$(date +%s)-${RANDOM}"
+    candidate=$(_fw_new_candidate "$conf_file" "速率限制规则") || return 1
+    printf 'add rule inet ops_filter ops_rate_limit tcp dport %s limit rate %s accept # ops-rate:%s\n' "$port" "$rate" "$rule_id" >> "$candidate"
+    printf 'add rule inet ops_filter ops_rate_limit tcp dport %s drop # ops-rate:%s\n' "$port" "$rule_id" >> "$candidate"
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
         log_info "速率限制已设置: 端口 ${port} 限制 ${rate}"
+    else
+        rm -f "$candidate"
+        log_error "添加失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
@@ -591,35 +1073,45 @@ fw_delete_rate_limit() {
 
     log_info "当前速率限制规则:"
     print_thin_separator
-    grep -n "limit rate\|dport.*drop" "$conf_file" | while IFS= read -r line; do
-        echo "  $line"
-    done
+    grep -n 'limit rate.*# ops-rate:' "$conf_file" || true
     print_thin_separator
 
-    local line_num
-    read_nonempty "请输入要删除的规则行号 (建议同时删除对应的 drop 规则)" line_num
-    if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-        sed -i "${line_num}d" "$conf_file"
-        if confirm "是否继续删除关联的 drop 规则?"; then
-            read_nonempty "请输入 drop 规则行号" line_num
-            sed -i "${line_num}d" "$conf_file"
-        fi
-        if _fw_validate_and_reload; then
-            log_info "速率限制规则已删除"
-        fi
-    else
+    local line_num selected rule_id candidate
+    read_nonempty "请输入要删除的规则行号" line_num
+    if ! [[ "$line_num" =~ ^[0-9]+$ ]]; then
         log_error "无效的行号"
+        return 1
+    fi
+    selected=$(sed -n "${line_num}p" "$conf_file")
+    if [[ "$selected" =~ ops-rate:([A-Za-z0-9-]+)$ ]]; then
+        rule_id="${BASH_REMATCH[1]}"
+    else
+        log_error "指定行不是本工具管理的速率限制规则"
+        return 1
+    fi
+    candidate=$(_fw_new_candidate "$conf_file" "速率限制规则") || return 1
+    sed -i "/# ops-rate:${rule_id}$/d" "$candidate"
+    if _fw_apply_candidate "$candidate" "$conf_file"; then
+        log_info "速率限制规则（accept/drop 配对）已删除"
+    else
+        rm -f "$candidate"
+        log_error "删除失败，原规则已保留或恢复"
+        return 1
     fi
 }
 
 # ---------- 重载防火墙 ----------
 fw_reload() {
     log_step "正在重载防火墙规则..."
-    systemctl restart nftables
-    if [ $? -eq 0 ]; then
+    if ! _fw_validate_bundle; then
+        log_error "规则验证失败，未重载"
+        return 1
+    fi
+    if systemctl restart nftables; then
         log_info "防火墙规则已重载"
     else
         log_error "防火墙重载失败"
+        return 1
     fi
 }
 
@@ -627,7 +1119,17 @@ fw_reload() {
 fw_export() {
     local export_file
     read_optional "导出文件路径" export_file "/root/nftables_backup_$(date +%Y%m%d%H%M%S).conf"
-    nft list ruleset > "$export_file"
+    local export_dir
+    export_dir=$(dirname "$export_file")
+    if [ ! -d "$export_dir" ]; then
+        log_error "导出目录不存在: ${export_dir}"
+        return 1
+    fi
+    if ! nft list ruleset > "$export_file"; then
+        log_error "规则导出失败"
+        return 1
+    fi
+    chmod 0600 "$export_file"
     log_info "规则已导出到: ${export_file}"
 }
 
@@ -641,14 +1143,21 @@ fw_import() {
         return 1
     fi
 
-    if confirm "导入将覆盖当前规则，确认继续?"; then
-        # 备份当前规则
-        fw_export
-        cp "$import_file" "$NFTABLES_BASE_CONF"
-        if _fw_validate_and_reload; then
+    if grep -Eq '(^|[[:space:]])flush[[:space:]]+ruleset([[:space:]]|$)|(^|[[:space:]])include[[:space:]]' "$import_file"; then
+        log_error "导入文件不得包含 flush ruleset 或 include；请提供单个自包含 ruleset"
+        return 1
+    fi
+    if ! nft -c -f "$import_file" 2>/dev/null; then
+        log_error "导入文件未通过 nft 语法验证"
+        nft -c -f "$import_file" || true
+        return 1
+    fi
+    if confirm "导入将替换本工具当前的基础及自定义规则，确认继续?"; then
+        if _fw_replace_managed_rules "$import_file"; then
             log_info "规则导入成功"
         else
-            log_error "导入的规则验证失败"
+            log_error "导入失败，原规则已恢复"
+            return 1
         fi
     fi
 }
@@ -656,28 +1165,29 @@ fw_import() {
 # ---------- 恢复默认规则 ----------
 fw_reset() {
     if confirm "确认恢复默认防火墙规则? 这将删除所有自定义规则"; then
-        # 备份
-        fw_export
-
-        # 删除自定义规则文件
-        find "$NFTABLES_DIR" -name "*.conf" ! -name "base.conf" -delete
-        log_info "已删除所有自定义规则文件"
-
-        fw_reload
-        log_info "防火墙已恢复为默认规则"
+        local ssh_port web=false base_candidate
+        ssh_port=$(get_ssh_port)
+        if ! _fw_validate_single_port "$ssh_port"; then
+            log_error "SSH 端口无效，拒绝重置"
+            return 1
+        fi
+        if grep -q 'tcp dport { 80, 443 } accept' "$NFTABLES_BASE_CONF" 2>/dev/null; then web=true; fi
+        base_candidate=$(mktemp "${NFTABLES_DIR}/.reset-base.XXXXXX") || return 1
+        _fw_write_base_conf "$base_candidate" "$ssh_port" "$web"
+        if _fw_replace_managed_rules "$base_candidate"; then
+            rm -f "$base_candidate"
+            log_info "防火墙已恢复为默认规则"
+        else
+            rm -f "$base_candidate"
+            log_error "恢复失败，原规则已恢复"
+            return 1
+        fi
     fi
 }
 
 # ---------- 验证并重载 ----------
 _fw_validate_and_reload() {
-    if nft -c -f "$NFTABLES_MAIN_CONF" 2>/dev/null; then
-        systemctl restart nftables
-        return $?
-    else
-        log_error "规则验证失败:"
-        nft -c -f "$NFTABLES_MAIN_CONF"
-        return 1
-    fi
+    fw_reload
 }
 
 # ============================================================
@@ -734,7 +1244,7 @@ f2b_status() {
 
     echo ""
     local jails
-    jails=$(_f2b_get_jail_list)
+    jails=$(_f2b_get_jail_list || true)
     if [ -n "$jails" ]; then
         log_info "各 Jail 封禁摘要:"
         print_thin_separator
@@ -760,7 +1270,7 @@ f2b_jail_detail() {
     echo ""
 
     local jails
-    jails=$(_f2b_get_jail_list)
+    jails=$(_f2b_get_jail_list || true)
     if [ -z "$jails" ]; then
         log_warn "没有活跃的 Jail，请检查 fail2ban 配置"
         return 0
@@ -783,7 +1293,7 @@ f2b_jail_detail() {
     echo ""
     log_info "Jail「${selected_jail}」的详细状态:"
     print_thin_separator
-    fail2ban-client status "$selected_jail" 2>/dev/null
+    fail2ban-client status "$selected_jail" 2>/dev/null || log_error "无法读取 Jail 状态"
     print_thin_separator
 }
 
@@ -796,7 +1306,7 @@ f2b_ban_ip() {
     echo ""
 
     local jails
-    jails=$(_f2b_get_jail_list)
+    jails=$(_f2b_get_jail_list || true)
     if [ -z "$jails" ]; then
         log_warn "没有活跃的 Jail"
         return 0
@@ -804,6 +1314,10 @@ f2b_ban_ip() {
 
     local ip
     read_nonempty "请输入要封禁的 IP 地址" ip
+    if ! _fw_validate_ip_cidr "$ip" || [[ "$ip" == */* ]]; then
+        log_error "请输入单个有效的 IPv4 或 IPv6 地址"
+        return 1
+    fi
 
     echo ""
     log_info "请选择封禁到哪个 Jail:"
@@ -835,7 +1349,7 @@ f2b_unban_ip() {
     echo ""
 
     local jails
-    jails=$(_f2b_get_jail_list)
+    jails=$(_f2b_get_jail_list || true)
     if [ -z "$jails" ]; then
         log_warn "没有活跃的 Jail"
         return 0
@@ -843,6 +1357,10 @@ f2b_unban_ip() {
 
     local ip
     read_nonempty "请输入要解封的 IP 地址" ip
+    if ! _fw_validate_ip_cidr "$ip" || [[ "$ip" == */* ]]; then
+        log_error "请输入单个有效的 IPv4 或 IPv6 地址"
+        return 1
+    fi
 
     echo ""
     log_info "请选择从哪个 Jail 解封:"
@@ -893,20 +1411,20 @@ f2b_edit_config() {
         # 读取当前配置值（优先读 jail.local，其次 jail.conf）
         local cur_bantime cur_findtime cur_maxretry cur_ignoreip
         local jail_conf="/etc/fail2ban/jail.conf"
-        cur_bantime=$(grep -E "^bantime[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
-        cur_findtime=$(grep -E "^findtime[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
-        cur_maxretry=$(grep -E "^maxretry[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
+        cur_bantime=$(grep -E "^bantime[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
+        cur_findtime=$(grep -E "^findtime[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
+        cur_maxretry=$(grep -E "^maxretry[[:space:]]*=" "$jail_conf" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
 
         if [ -f "$FAIL2BAN_JAIL_LOCAL" ]; then
-            local lb lf lm
-            lb=$(grep -E "^bantime[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
-            lf=$(grep -E "^findtime[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
-            lm=$(grep -E "^maxretry[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ')
-            li=$(grep -E "^ignoreip[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{$1=""; print}' | sed 's/^[[:space:]]*//')
-            [ -n "$lb" ] && cur_bantime="$lb"
-            [ -n "$lf" ] && cur_findtime="$lf"
-            [ -n "$lm" ] && cur_maxretry="$lm"
-            [ -n "$li" ] && cur_ignoreip="$li"
+            local lb lf lm li
+            lb=$(grep -E "^bantime[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
+            lf=$(grep -E "^findtime[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
+            lm=$(grep -E "^maxretry[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{print $2}' | tr -d ' ' || true)
+            li=$(grep -E "^ignoreip[[:space:]]*=" "$FAIL2BAN_JAIL_LOCAL" 2>/dev/null | head -1 | awk -F= '{$1=""; print}' | sed 's/^[[:space:]]*//' || true)
+            if [ -n "$lb" ]; then cur_bantime="$lb"; fi
+            if [ -n "$lf" ]; then cur_findtime="$lf"; fi
+            if [ -n "$lm" ]; then cur_maxretry="$lm"; fi
+            if [ -n "$li" ]; then cur_ignoreip="$li"; fi
         fi
 
         log_info "当前 DEFAULT 区块配置:"
@@ -1007,7 +1525,7 @@ f2b_service_control() {
         echo ""
 
         local status="未运行 ✗"
-        systemctl is-active fail2ban &>/dev/null && status="运行中 ✓"
+        if systemctl is-active fail2ban &>/dev/null; then status="运行中 ✓"; fi
         log_info "当前状态: ${status}"
         echo ""
         echo "  1) 启动 fail2ban"
@@ -1089,8 +1607,17 @@ fw_quick_blacklist() {
     print_separator
     echo ""
 
+    if ! _fw_migrate_legacy_layout; then
+        log_error "旧版防火墙规则迁移失败，已保留原配置；拒绝继续修改"
+        return 1
+    fi
+
     local ip
     read_nonempty "请输入要拉黑的恶意 IP 地址或网段 (如: 1.2.3.4 或 1.2.3.0/24)" ip
+    if ! _fw_validate_ip_cidr "$ip"; then
+        log_error "无效的 IP 地址或 CIDR"
+        return 1
+    fi
 
     echo ""
     echo "拉黑方式:"
@@ -1103,34 +1630,21 @@ fw_quick_blacklist() {
 
     # 提取 nftables 和 fail2ban 操作的内联函数
     _do_nft_blacklist() {
-        local conf_file="${NFTABLES_DIR}/ip_blacklist.conf"
-        if [ ! -f "$conf_file" ]; then
-            cat > "$conf_file" << 'NFTEOF'
-#!/usr/sbin/nft -f
-# IP 黑名单规则
-table inet ip_blacklist {
-    chain input {
-        type filter hook input priority -20; policy accept;
-    }
-}
-NFTEOF
-        fi
-        sed -i "/^    chain input {/,/^    }/ { /^    }/i\\
-        ip saddr ${ip} drop  # blacklist $(date '+%Y-%m-%d %H:%M')
-}" "$conf_file"
-        if _fw_validate_and_reload; then
+        local conf_file="${NFTABLES_DIR}/ip_blacklist.conf" family
+        family=$(_fw_address_family_keyword "$ip")
+        if _fw_append_rule "$conf_file" "IP 黑名单规则" \
+            "add rule inet ops_filter ops_blacklist ${family} saddr ${ip} drop # ops-blacklist"; then
             log_info "nftables 已封禁: ${ip}"
             nft_ok=true
         else
-            log_error "nftables 封禁失败，正在回滚..."
-            sed -i "\|ip saddr ${ip} drop.*blacklist|d" "$conf_file"
+            log_error "nftables 封禁失败，原规则已保留或恢复"
         fi
     }
 
     _do_f2b_blacklist() {
         if command -v fail2ban-client &>/dev/null && systemctl is-active fail2ban &>/dev/null; then
             local jails
-            jails=$(_f2b_get_jail_list)
+            jails=$(_f2b_get_jail_list || true)
             if [ -n "$jails" ]; then
                 local first_jail
                 first_jail=$(echo "$jails" | head -1)
@@ -1169,37 +1683,69 @@ TEMP_WHITELIST_DATA="/etc/ops-scripts/temp_whitelist.dat"
 TEMP_WHITELIST_CONF="${NFTABLES_DIR}/temp_whitelist.conf"
 TEMP_WHITELIST_CLEANUP="/etc/ops-scripts/temp_whitelist_cleanup.sh"
 
-_rebuild_temp_whitelist_conf() {
-    local now
+_render_temp_whitelist_conf() {
+    local data_file="$1" output="$2" now ip expiry desc family
     now=$(date +%s)
-
     {
-        echo "#!/usr/sbin/nft -f"
-        echo "# 临时 IP 白名单规则 - 由 ops-scripts 自动管理"
-        echo "# 警告: 此文件由程序自动生成，请勿手动编辑"
-        echo "table inet temp_whitelist {"
-        echo "    chain input {"
-        echo "        type filter hook input priority -15; policy accept;"
-
-        if [ -f "$TEMP_WHITELIST_DATA" ]; then
+        printf '%s\n' '#!/usr/sbin/nft -f' '# 临时 IP 白名单规则 - 由 ops-scripts 自动管理'
+        if [ -f "$data_file" ]; then
             while IFS=' ' read -r ip expiry desc || [ -n "$ip" ]; do
                 [ -z "$ip" ] && continue
                 [[ "$ip" =~ ^# ]] && continue
-                if [ "$expiry" -gt "$now" ]; then
-                    local expire_str
-                    expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-                    if [[ "$ip" == *:* ]]; then
-                        echo "        ip6 saddr ${ip} accept  # temp_whitelist expires ${expire_str}"
-                    else
-                        echo "        ip saddr ${ip} accept  # temp_whitelist expires ${expire_str}"
-                    fi
+                if ! _fw_validate_ip_cidr "$ip" || ! [[ "$expiry" =~ ^[0-9]+$ ]]; then
+                    log_error "临时白名单数据存在无效记录: ${ip} ${expiry}"
+                    return 1
                 fi
-            done < "$TEMP_WHITELIST_DATA"
+                if [ "$expiry" -gt "$now" ]; then
+                    family=$(_fw_address_family_keyword "$ip")
+                    printf 'add rule inet ops_filter ops_whitelist %s saddr %s accept # ops-temp-whitelist\n' "$family" "$ip"
+                fi
+            done < "$data_file"
         fi
+    } > "$output"
+}
 
-        echo "    }"
-        echo "}"
-    } > "$TEMP_WHITELIST_CONF"
+_apply_temp_whitelist_data() (
+    local data_candidate="$1" conf_candidate data_backup conf_backup
+    local data_existed=false conf_existed=false
+    cleanup_temp_whitelist_transaction() {
+        rm -f -- "$data_candidate" "${conf_candidate:-}" "${data_backup:-}" "${conf_backup:-}"
+    }
+    trap cleanup_temp_whitelist_transaction EXIT HUP INT TERM
+    conf_candidate=$(mktemp "${NFTABLES_DIR}/.temp-white.XXXXXX") || return 1
+    if ! _render_temp_whitelist_conf "$data_candidate" "$conf_candidate"; then
+        rm -f "$conf_candidate"
+        return 1
+    fi
+    if ! _fw_validate_bundle "$conf_candidate" "$TEMP_WHITELIST_CONF"; then
+        rm -f "$conf_candidate"
+        return 1
+    fi
+    data_backup=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-data-backup.XXXXXX") || return 1
+    conf_backup=$(mktemp "${NFTABLES_DIR}/.tw-conf-backup.XXXXXX") || return 1
+    if [ -f "$TEMP_WHITELIST_DATA" ]; then cp -p -- "$TEMP_WHITELIST_DATA" "$data_backup"; data_existed=true; fi
+    if [ -f "$TEMP_WHITELIST_CONF" ]; then cp -p -- "$TEMP_WHITELIST_CONF" "$conf_backup"; conf_existed=true; fi
+    chmod 0600 "$data_candidate"
+    chmod 0644 "$conf_candidate"
+    mv -f -- "$data_candidate" "$TEMP_WHITELIST_DATA"
+    mv -f -- "$conf_candidate" "$TEMP_WHITELIST_CONF"
+    if systemctl restart nftables; then
+        rm -f "$data_backup" "$conf_backup"
+        return 0
+    fi
+    log_error "临时白名单重载失败，正在同时恢复数据与规则文件"
+    if [ "$data_existed" = true ]; then mv -f -- "$data_backup" "$TEMP_WHITELIST_DATA"; else rm -f "$TEMP_WHITELIST_DATA" "$data_backup"; fi
+    if [ "$conf_existed" = true ]; then mv -f -- "$conf_backup" "$TEMP_WHITELIST_CONF"; else rm -f "$TEMP_WHITELIST_CONF" "$conf_backup"; fi
+    systemctl restart nftables || log_error "旧临时白名单恢复后仍无法重载，请立即人工检查"
+    return 1
+)
+
+_rebuild_temp_whitelist_conf() {
+    local candidate
+    ensure_marker_dir
+    candidate=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-data.XXXXXX") || return 1
+    if [ -f "$TEMP_WHITELIST_DATA" ]; then cp -p -- "$TEMP_WHITELIST_DATA" "$candidate"; fi
+    _apply_temp_whitelist_data "$candidate"
 }
 
 _clean_expired_temp_whitelist() {
@@ -1210,14 +1756,18 @@ _clean_expired_temp_whitelist() {
     local now
     now=$(date +%s)
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-clean.XXXXXX") || return 1
     local changed=false
 
     while IFS=' ' read -r ip expiry desc || [ -n "$ip" ]; do
         [ -z "$ip" ] && continue
         [[ "$ip" =~ ^# ]] && continue
-        if [ "$expiry" -gt "$now" ]; then
-            echo "$ip $expiry $desc" >> "$tmpfile"
+        if ! [[ "$expiry" =~ ^[0-9]+$ ]] || ! _fw_validate_ip_cidr "$ip"; then
+            rm -f "$tmpfile"
+            log_error "临时白名单数据损坏，拒绝清理: ${ip} ${expiry}"
+            return 1
+        elif [ "$expiry" -gt "$now" ]; then
+            printf '%s %s %s\n' "$ip" "$expiry" "$desc" >> "$tmpfile"
         else
             changed=true
             local expire_str
@@ -1227,10 +1777,12 @@ _clean_expired_temp_whitelist() {
     done < "$TEMP_WHITELIST_DATA"
 
     if [ "$changed" = true ]; then
-        mv "$tmpfile" "$TEMP_WHITELIST_DATA"
-        _rebuild_temp_whitelist_conf
-        if _fw_validate_and_reload; then
+        if _apply_temp_whitelist_data "$tmpfile"; then
             log_info "✓ 防火墙规则已重载"
+        else
+            rm -f "$tmpfile"
+            log_error "清理失败，原数据与规则已恢复"
+            return 1
         fi
     else
         rm -f "$tmpfile"
@@ -1284,6 +1836,10 @@ temp_whitelist_add() {
 
     local ip
     read_nonempty "请输入要加入白名单的 IP 地址或网段 (IPv4/IPv6/CIDR)" ip
+    if ! _fw_validate_ip_cidr "$ip"; then
+        log_error "无效的 IP 地址或 CIDR"
+        return 1
+    fi
 
     echo ""
     echo "请选择过期时间:"
@@ -1304,7 +1860,7 @@ temp_whitelist_add() {
         5) hours=168 ;;
         6)
             read_nonempty "请输入小时数" hours
-            if ! [[ "$hours" =~ ^[0-9]+$ ]] || [ "$hours" -lt 1 ]; then
+            if ! [[ "$hours" =~ ^[0-9]+$ ]] || [ "$hours" -lt 1 ] || [ "$hours" -gt 8760 ]; then
                 log_error "无效的小时数"
                 return 1
             fi
@@ -1313,6 +1869,8 @@ temp_whitelist_add() {
 
     local desc
     read_optional "备注信息" desc "手动添加"
+    desc="${desc//$'\n'/ }"
+    desc="${desc//$'\r'/ }"
 
     local expiry
     expiry=$(( $(date +%s) + hours * 3600 ))
@@ -1320,19 +1878,18 @@ temp_whitelist_add() {
     expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "未知")
 
     ensure_marker_dir
-    echo "${ip} ${expiry} ${desc:-手动添加}" >> "$TEMP_WHITELIST_DATA"
+    local data_candidate
+    data_candidate=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-add.XXXXXX") || return 1
+    if [ -f "$TEMP_WHITELIST_DATA" ]; then cp -p -- "$TEMP_WHITELIST_DATA" "$data_candidate"; fi
+    printf '%s %s %s\n' "$ip" "$expiry" "${desc:-手动添加}" >> "$data_candidate"
 
-    _rebuild_temp_whitelist_conf
-
-    if _fw_validate_and_reload; then
+    if _apply_temp_whitelist_data "$data_candidate"; then
         log_info "✓ 临时白名单已添加: ${ip}"
         log_info "  过期时间: ${expire_str} (${hours} 小时后)"
     else
-        # 回滚
-        awk -v ip="$ip" -v expiry="$expiry" '!($1 == ip && $2 == expiry)' \
-            "$TEMP_WHITELIST_DATA" > /tmp/tw_rollback.tmp && mv /tmp/tw_rollback.tmp "$TEMP_WHITELIST_DATA"
-        _rebuild_temp_whitelist_conf
-        log_error "添加失败，已回滚"
+        rm -f "$data_candidate"
+        log_error "添加失败，原数据与规则已恢复"
+        return 1
     fi
 }
 
@@ -1349,7 +1906,7 @@ temp_whitelist_delete() {
     echo ""
 
     local total
-    total=$(grep -c -v '^#' "$TEMP_WHITELIST_DATA" 2>/dev/null || echo 0)
+    total=$(awk 'NF && $1 !~ /^#/ {count++} END {print count+0}' "$TEMP_WHITELIST_DATA")
     if [ "$total" -eq 0 ]; then
         log_warn "没有可删除的条目"
         return 0
@@ -1363,23 +1920,21 @@ temp_whitelist_delete() {
     fi
 
     local line_to_delete
-    line_to_delete=$(grep -v '^#' "$TEMP_WHITELIST_DATA" | sed -n "${idx}p")
+    line_to_delete=$(awk 'NF && $1 !~ /^#/' "$TEMP_WHITELIST_DATA" | sed -n "${idx}p")
     local ip_to_delete expiry_to_delete
     ip_to_delete=$(echo "$line_to_delete" | awk '{print $1}')
     expiry_to_delete=$(echo "$line_to_delete" | awk '{print $2}')
 
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-delete.XXXXXX") || return 1
     awk -v ip="$ip_to_delete" -v expiry="$expiry_to_delete" \
         '!($1 == ip && $2 == expiry)' "$TEMP_WHITELIST_DATA" > "$tmpfile"
-    mv "$tmpfile" "$TEMP_WHITELIST_DATA"
-
-    _rebuild_temp_whitelist_conf
-
-    if _fw_validate_and_reload; then
+    if _apply_temp_whitelist_data "$tmpfile"; then
         log_info "✓ 已删除临时白名单: ${ip_to_delete}"
     else
-        log_error "删除后规则重载失败"
+        rm -f "$tmpfile"
+        log_error "删除失败，原数据与规则已恢复"
+        return 1
     fi
 }
 
@@ -1424,10 +1979,14 @@ temp_whitelist_setup_cron() {
         4) cron_schedule="0 * * * *" ;;
     esac
 
-    _generate_temp_whitelist_cleanup_script
+    _generate_temp_whitelist_cleanup_script || return 1
 
-    echo "${cron_schedule} root ${TEMP_WHITELIST_CLEANUP} >> /var/log/ops-temp-whitelist.log 2>&1" > "$cron_file"
-    chmod 644 "$cron_file"
+    local cron_candidate
+    cron_candidate=$(mktemp "$(dirname "$cron_file")/.ops-temp-whitelist.XXXXXX") || return 1
+    printf '%s root %s >> /var/log/ops-temp-whitelist.log 2>&1\n' \
+        "$cron_schedule" "$TEMP_WHITELIST_CLEANUP" > "$cron_candidate"
+    chmod 0644 "$cron_candidate"
+    mv -f -- "$cron_candidate" "$cron_file"
 
     log_info "✓ 自动清理任务已设置: ${cron_schedule}"
     log_info "  日志文件: /var/log/ops-temp-whitelist.log"
@@ -1435,8 +1994,9 @@ temp_whitelist_setup_cron() {
 
 _generate_temp_whitelist_cleanup_script() {
     ensure_marker_dir
-
-    cat > "$TEMP_WHITELIST_CLEANUP" << 'CLEANUP_EOF'
+    local script_candidate
+    script_candidate=$(mktemp "$(dirname "$TEMP_WHITELIST_CLEANUP")/.tw-cleanup.XXXXXX") || return 1
+    cat > "$script_candidate" << 'CLEANUP_EOF'
 #!/usr/bin/env bash
 # 临时 IP 白名单自动清理脚本 - 由 ops-scripts 自动生成，请勿手动编辑
 set -euo pipefail
@@ -1448,14 +2008,25 @@ TEMP_WHITELIST_CONF="${NFTABLES_DIR}/temp_whitelist.conf"
 [ ! -f "$TEMP_WHITELIST_DATA" ] && exit 0
 
 NOW=$(date +%s)
-TMPFILE=$(mktemp)
+DATA_CANDIDATE=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-cron-data.XXXXXX")
+CONF_CANDIDATE=$(mktemp "${NFTABLES_DIR}/.tw-cron-conf.XXXXXX")
+BUNDLE=$(mktemp "${NFTABLES_DIR}/.tw-cron-bundle.XXXXXX")
+DATA_BACKUP=$(mktemp "$(dirname "$TEMP_WHITELIST_DATA")/.tw-cron-data-backup.XXXXXX")
+CONF_BACKUP=$(mktemp "${NFTABLES_DIR}/.tw-cron-conf-backup.XXXXXX")
+cleanup() {
+    rm -f "$DATA_CANDIDATE" "$CONF_CANDIDATE" "$BUNDLE" "$DATA_BACKUP" "$CONF_BACKUP"
+}
+trap cleanup EXIT HUP INT TERM
 CHANGED=false
 
 while IFS=' ' read -r ip expiry desc || [ -n "$ip" ]; do
     [ -z "$ip" ] && continue
     [[ "$ip" =~ ^# ]] && continue
-    if [ "$expiry" -gt "$NOW" ]; then
-        echo "$ip $expiry $desc" >> "$TMPFILE"
+    if ! [[ "$expiry" =~ ^[0-9]+$ ]]; then
+        echo "临时白名单数据损坏: $ip $expiry" >&2
+        exit 1
+    elif [ "$expiry" -gt "$NOW" ]; then
+        printf '%s %s %s\n' "$ip" "$expiry" "$desc" >> "$DATA_CANDIDATE"
     else
         CHANGED=true
         expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
@@ -1464,49 +2035,68 @@ while IFS=' ' read -r ip expiry desc || [ -n "$ip" ]; do
 done < "$TEMP_WHITELIST_DATA"
 
 if [ "$CHANGED" = true ]; then
-    mv "$TMPFILE" "$TEMP_WHITELIST_DATA"
-
     {
-        echo "#!/usr/sbin/nft -f"
-        echo "# 临时 IP 白名单规则 - 由 ops-scripts 自动管理"
-        echo "table inet temp_whitelist {"
-        echo "    chain input {"
-        echo "        type filter hook input priority -15; policy accept;"
-        if [ -s "$TEMP_WHITELIST_DATA" ]; then
+        printf '%s\n' '#!/usr/sbin/nft -f' '# 临时 IP 白名单规则 - 由 ops-scripts 自动管理'
+        if [ -s "$DATA_CANDIDATE" ]; then
             while IFS=' ' read -r ip expiry desc || [ -n "$ip" ]; do
                 [ -z "$ip" ] && continue
                 [[ "$ip" =~ ^# ]] && continue
                 if [ "$expiry" -gt "$NOW" ]; then
-                    expire_str=$(date -d "@${expiry}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
                     if [[ "$ip" == *:* ]]; then
-                        echo "        ip6 saddr ${ip} accept  # temp_whitelist expires ${expire_str}"
+                        printf 'add rule inet ops_filter ops_whitelist ip6 saddr %s accept # ops-temp-whitelist\n' "$ip"
                     else
-                        echo "        ip saddr ${ip} accept  # temp_whitelist expires ${expire_str}"
+                        printf 'add rule inet ops_filter ops_whitelist ip saddr %s accept # ops-temp-whitelist\n' "$ip"
                     fi
                 fi
-            done < "$TEMP_WHITELIST_DATA"
+            done < "$DATA_CANDIDATE"
         fi
-        echo "    }"
-        echo "}"
-    } > "$TEMP_WHITELIST_CONF"
+    } > "$CONF_CANDIDATE"
 
-    if nft -c -f /etc/nftables.conf 2>/dev/null; then
-        systemctl restart nftables
+    printf 'flush ruleset\n' > "$BUNDLE"
+    cat "${NFTABLES_DIR}/base.conf" >> "$BUNDLE"
+    for file in custom_ports.conf ip_whitelist.conf ip_blacklist.conf rate_limit.conf port_forward.conf; do
+        [ -f "${NFTABLES_DIR}/${file}" ] && cat "${NFTABLES_DIR}/${file}" >> "$BUNDLE"
+    done
+    cat "$CONF_CANDIDATE" >> "$BUNDLE"
+    nft -c -f "$BUNDLE"
+
+    cp -p "$TEMP_WHITELIST_DATA" "$DATA_BACKUP"
+    CONF_EXISTED=false
+    if [ -f "$TEMP_WHITELIST_CONF" ]; then
+        cp -p "$TEMP_WHITELIST_CONF" "$CONF_BACKUP"
+        CONF_EXISTED=true
+    fi
+    chmod 0600 "$DATA_CANDIDATE"
+    chmod 0644 "$CONF_CANDIDATE"
+    mv -f "$DATA_CANDIDATE" "$TEMP_WHITELIST_DATA"
+    mv -f "$CONF_CANDIDATE" "$TEMP_WHITELIST_CONF"
+
+    if systemctl restart nftables; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 防火墙规则已重载"
     else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 防火墙规则验证失败，请手动检查"
+        mv -f "$DATA_BACKUP" "$TEMP_WHITELIST_DATA"
+        if [ "$CONF_EXISTED" = true ]; then
+            mv -f "$CONF_BACKUP" "$TEMP_WHITELIST_CONF"
+        else
+            rm -f "$TEMP_WHITELIST_CONF"
+        fi
+        systemctl restart nftables || echo "旧规则恢复后仍无法重载，请立即人工检查" >&2
+        exit 1
     fi
-else
-    rm -f "$TMPFILE"
 fi
 CLEANUP_EOF
 
-    chmod 755 "$TEMP_WHITELIST_CLEANUP"
+    chmod 0755 "$script_candidate"
+    mv -f -- "$script_candidate" "$TEMP_WHITELIST_CLEANUP"
     log_info "清理脚本已生成: ${TEMP_WHITELIST_CLEANUP}"
 }
 
 # ---------- 临时 IP 白名单资源池主菜单 ----------
 temp_whitelist_manage() {
+    if ! _fw_migrate_legacy_layout; then
+        log_error "旧版防火墙规则迁移失败，已保留原配置；拒绝继续修改"
+        return 1
+    fi
     while true; do
         print_separator
         echo -e "${BOLD}  临时 IP 白名单资源池${NC}"

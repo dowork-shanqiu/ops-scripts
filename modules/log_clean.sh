@@ -8,8 +8,8 @@
 # - 自定义目录清理
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+LOG_CLEAN_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${LOG_CLEAN_MODULE_DIR}/common.sh"
 
 # ============================================================
 # 日志空间分析
@@ -30,7 +30,7 @@ log_show_usage() {
 
     log_step "/var/log 中占用最大的文件/目录 (Top 10):"
     print_thin_separator
-    du -sh /var/log/* 2>/dev/null | sort -rh | head -10 | awk '{printf "  %-10s  %s\n", $1, $2}'
+    du -sh /var/log/* 2>/dev/null | sort -rh | sed -n '1,10p' | awk '{printf "  %-10s  %s\n", $1, $2}' || true
     print_thin_separator
     echo ""
 
@@ -169,51 +169,49 @@ log_clean_old_logs() {
         echo ""
         select_option "请选择" 4 0
 
+        local days=""
+        if [ "$SELECTED_OPTION" -eq 4 ]; then
+            read_nonempty "请输入天数 (清理 /var/log 中超过 N 天未修改的日志文件)" days
+            if ! validate_nonnegative_integer "$days" || [ "$days" -lt 1 ]; then
+                log_error "无效的天数"
+                press_any_key
+                continue
+            fi
+        elif [ "$SELECTED_OPTION" -eq 0 ]; then
+            return 0
+        fi
+
+        local manifest
+        manifest=$(mktemp) || return 1
         case "$SELECTED_OPTION" in
-            1)
-                if [ "$gz_count" -eq 0 ]; then
-                    log_info "没有压缩日志文件"
-                elif confirm "确认删除 ${gz_count} 个压缩日志文件?"; then
-                    find /var/log -name "*.gz" -delete 2>/dev/null
-                    log_info "✓ 已删除 ${gz_count} 个压缩日志文件"
-                fi
-                ;;
-            2)
-                if [ "$old_count" -eq 0 ]; then
-                    log_info "没有轮转日志文件"
-                elif confirm "确认删除 ${old_count} 个轮转日志文件?"; then
-                    find /var/log -name "*.[0-9]" -delete 2>/dev/null
-                    log_info "✓ 已删除 ${old_count} 个轮转日志文件"
-                fi
-                ;;
-            3)
-                local total_count=$(( gz_count + old_count ))
-                if [ "$total_count" -eq 0 ]; then
-                    log_info "没有旧日志文件需要清理"
-                elif confirm "确认删除全部 ${total_count} 个旧日志文件?"; then
-                    find /var/log -name "*.gz" -delete 2>/dev/null
-                    find /var/log -name "*.[0-9]" -delete 2>/dev/null
-                    log_info "✓ 已删除 ${total_count} 个旧日志文件"
-                fi
-                ;;
-            4)
-                local days
-                read_nonempty "请输入天数 (清理 /var/log 中超过 N 天未修改的日志文件)" days
-                if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ]; then
-                    log_error "无效的天数"
-                else
-                    local count
-                    count=$(find /var/log \( -name "*.log" -o -name "*.gz" \) -mtime +"$days" 2>/dev/null | wc -l)
-                    if [ "$count" -eq 0 ]; then
-                        log_info "没有超过 ${days} 天的日志文件"
-                    elif confirm "确认删除 ${count} 个超过 ${days} 天的日志文件?"; then
-                        find /var/log \( -name "*.log" -o -name "*.gz" \) -mtime +"$days" -delete 2>/dev/null
-                        log_info "✓ 已清理超过 ${days} 天的日志文件"
-                    fi
-                fi
-                ;;
-            0) return 0 ;;
+            1) find /var/log -xdev -type f -name '*.gz' -print0 > "$manifest" ;;
+            2) find /var/log -xdev -type f -name '*.[0-9]' -print0 > "$manifest" ;;
+            3) find /var/log -xdev -type f \( -name '*.gz' -o -name '*.[0-9]' \) -print0 > "$manifest" ;;
+            4) find /var/log -xdev -type f \( -name '*.log' -o -name '*.gz' \) -mtime +"$days" -print0 > "$manifest" ;;
         esac
+        local count
+        count=$(tr -cd '\000' < "$manifest" | wc -c)
+        if [ "$count" -eq 0 ]; then
+            rm -f "$manifest"
+            log_info "没有符合条件的日志文件"
+        else
+            log_warn "将删除以下 ${count} 个普通文件（不跨文件系统）:"
+            local shown=0 file
+            while IFS= read -r -d '' file; do
+                printf '  %s\n' "$file"
+                shown=$((shown + 1))
+                [ "$shown" -ge 50 ] && break
+            done < "$manifest"
+            [ "$count" -gt 50 ] && printf '  ... 其余 %d 个文件未显示\n' "$((count - 50))"
+            if confirm "确认永久删除以上 ${count} 个日志文件?"; then
+                if _delete_cleanup_manifest "$manifest" "/var/log"; then
+                    log_info "✓ 日志文件清理完成"
+                else
+                    log_warn "清理完成，但部分文件因状态变化或错误被跳过"
+                fi
+            fi
+            rm -f "$manifest"
+        fi
         press_any_key
     done
 }
@@ -254,7 +252,7 @@ log_clean_apt_cache() {
                 ;;
             3)
                 log_info "不再需要的依赖包预览:"
-                apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | head -20 | awk '{print "  " $0}'
+                apt-get autoremove --dry-run 2>/dev/null | grep "^Remv" | sed -n '1,20p' | awk '{print "  " $0}' || true
                 if confirm "确认删除以上不再需要的依赖包?"; then
                     apt autoremove -y
                     log_info "✓ 不再需要的依赖包已删除"
@@ -280,6 +278,26 @@ log_clean_apt_cache() {
 # ============================================================
 # 自定义目录清理
 # ============================================================
+_delete_cleanup_manifest() {
+    local manifest="$1"
+    local target_dir="$2"
+    local file
+    local failed=0
+    while IFS= read -r -d '' file; do
+        # 防止目录在确认后被替换或清单内容越界；只删除普通、非符号链接文件。
+        if [[ "$file" != "$target_dir/"* ]] || [ ! -f "$file" ] || [ -L "$file" ]; then
+            log_warn "跳过已变化或越界的文件: ${file}"
+            failed=1
+            continue
+        fi
+        if ! rm -f -- "$file"; then
+            log_warn "删除失败: ${file}"
+            failed=1
+        fi
+    done < "$manifest"
+    return "$failed"
+}
+
 log_clean_custom() {
     print_separator
     echo -e "${BOLD}  自定义目录清理${NC}"
@@ -289,10 +307,13 @@ log_clean_custom() {
     local target_dir
     read_nonempty "请输入要清理的目录路径 (如: /var/log/nginx)" target_dir
 
-    if [ ! -d "$target_dir" ]; then
-        log_error "目录不存在: ${target_dir}"
+    local normalized_dir
+    normalized_dir=$(normalize_existing_directory "$target_dir") || true
+    if [ -z "$normalized_dir" ] || ! is_safe_cleanup_directory "$normalized_dir"; then
+        log_error "拒绝清理此目录。仅允许已存在的日志或应用数据子目录，且禁止系统/用户根目录"
         return 1
     fi
+    target_dir="$normalized_dir"
 
     log_info "目录大小: $(du -sh "$target_dir" 2>/dev/null | cut -f1)"
     echo ""
@@ -303,53 +324,55 @@ log_clean_custom() {
     echo "  0) 返回"
     select_option "请选择" 4 0
 
-    case "$SELECTED_OPTION" in
-        1)
-            local count
-            count=$(find "$target_dir" -name "*.gz" 2>/dev/null | wc -l)
-            if [ "$count" -eq 0 ]; then
-                log_info "没有压缩日志文件"
-            elif confirm "确认删除 ${target_dir} 中 ${count} 个压缩日志文件?"; then
-                find "$target_dir" -name "*.gz" -delete 2>/dev/null
-                log_info "✓ 已清理压缩日志"
-            fi
-            ;;
-        2)
-            local count
-            count=$(find "$target_dir" -name "*.[0-9]" 2>/dev/null | wc -l)
-            if [ "$count" -eq 0 ]; then
-                log_info "没有轮转日志文件"
-            elif confirm "确认删除 ${target_dir} 中 ${count} 个轮转日志文件?"; then
-                find "$target_dir" -name "*.[0-9]" -delete 2>/dev/null
-                log_info "✓ 已清理轮转日志"
-            fi
-            ;;
-        3)
+    local days=""
+    if [ "$SELECTED_OPTION" -eq 3 ]; then
             local days
             read_nonempty "请输入天数" days
-            if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ]; then
+            if ! validate_nonnegative_integer "$days" || [ "$days" -lt 1 ]; then
                 log_error "无效的天数"
                 return 1
             fi
-            local count
-            count=$(find "$target_dir" -mtime +"$days" -type f 2>/dev/null | wc -l)
-            if [ "$count" -eq 0 ]; then
-                log_info "没有超过 ${days} 天未修改的文件"
-            elif confirm "确认删除 ${target_dir} 中超过 ${days} 天的 ${count} 个文件?"; then
-                find "$target_dir" -mtime +"$days" -type f -delete 2>/dev/null
-                log_info "✓ 已清理超过 ${days} 天的文件"
-            fi
-            ;;
-        4)
-            log_warn "将删除 ${target_dir} 下所有 *.gz 和 *.[0-9] 旧日志，保留当前 *.log 文件"
-            if confirm "确认执行?"; then
-                find "$target_dir" -name "*.gz" -delete 2>/dev/null
-                find "$target_dir" -name "*.[0-9]" -delete 2>/dev/null
-                log_info "✓ 旧日志文件已清理"
-            fi
-            ;;
-        0) return 0 ;;
+    elif [ "$SELECTED_OPTION" -eq 0 ]; then
+        return 0
+    fi
+
+    local manifest
+    manifest=$(mktemp) || return 1
+    case "$SELECTED_OPTION" in
+        1) find "$target_dir" -xdev -type f -name '*.gz' -print0 > "$manifest" ;;
+        2) find "$target_dir" -xdev -type f -name '*.[0-9]' -print0 > "$manifest" ;;
+        3) find "$target_dir" -xdev -type f -mtime +"$days" -print0 > "$manifest" ;;
+        4) find "$target_dir" -xdev -type f \( -name '*.gz' -o -name '*.[0-9]' \) -print0 > "$manifest" ;;
     esac
+
+    local count
+    count=$(tr -cd '\000' < "$manifest" | wc -c)
+    if [ "$count" -eq 0 ]; then
+        rm -f "$manifest"
+        log_info "没有符合条件的文件"
+        return 0
+    fi
+
+    log_warn "候选文件共 ${count} 个（不跨文件系统）:"
+    local shown=0
+    local file
+    while IFS= read -r -d '' file; do
+        printf '  %s\n' "$file"
+        shown=$((shown + 1))
+        if [ "$shown" -ge 50 ]; then
+            [ "$count" -gt 50 ] && printf '  ... 其余 %d 个文件未显示\n' "$((count - 50))"
+            break
+        fi
+    done < "$manifest"
+
+    if confirm "确认永久删除以上 ${count} 个文件?"; then
+        if _delete_cleanup_manifest "$manifest" "$target_dir"; then
+            log_info "✓ 清理完成"
+        else
+            log_warn "清理完成，但部分文件因状态变化或错误被跳过"
+        fi
+    fi
+    rm -f "$manifest"
 
     echo ""
     log_info "清理后目录大小: $(du -sh "$target_dir" 2>/dev/null | cut -f1)"
@@ -398,7 +421,7 @@ logrotate_show_status() {
 
     log_step "logrotate 主配置文件 (/etc/logrotate.conf):"
     if [ -f /etc/logrotate.conf ]; then
-        grep -v '^#' /etc/logrotate.conf | grep -v '^$' | head -20 | awk '{print "  " $0}'
+        grep -v '^#' /etc/logrotate.conf | grep -v '^$' | sed -n '1,20p' | awk '{print "  " $0}' || true
     else
         log_warn "未找到 /etc/logrotate.conf"
     fi
@@ -465,6 +488,10 @@ logrotate_run_now() {
                 echo ""
                 local conf_name
                 read_nonempty "请输入配置文件名称 (位于 /etc/logrotate.d/)" conf_name
+                if [[ ! "$conf_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+                    log_error "配置文件名称格式无效"
+                    continue
+                fi
                 local conf_path="/etc/logrotate.d/${conf_name}"
                 if [ ! -f "$conf_path" ]; then
                     log_error "配置文件不存在: ${conf_path}"
@@ -566,13 +593,14 @@ logrotate_add_config() {
     echo ""
 
     local conf_name
-    read_nonempty "请输入配置名称 (将保存为 /etc/logrotate.d/<名称>)" conf_name
+    read_nonempty "请输入配置名称 (将保存为 /etc/logrotate.d/ops-<名称>)" conf_name
     # Sanitize name: must start with alphanumeric, only allow alphanumeric, dash, underscore
     if ! echo "$conf_name" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]*$'; then
         log_error "名称必须以字母或数字开头，且只能包含字母、数字、连字符和下划线"
         return 1
     fi
 
+    conf_name="ops-${conf_name#ops-}"
     local conf_path="/etc/logrotate.d/${conf_name}"
     if [ -f "$conf_path" ]; then
         log_warn "配置文件已存在: ${conf_path}"
@@ -584,6 +612,10 @@ logrotate_add_config() {
     echo ""
     local log_path
     read_nonempty "请输入要轮转的日志文件路径 (支持通配符，如 /var/log/myapp/*.log)" log_path
+    if [[ "$log_path" != /* || "$log_path" == *$'\n'* || "$log_path" == *'{'* || "$log_path" == *'}'* ]]; then
+        log_error "日志路径必须是单行绝对路径，且不能包含大括号"
+        return 1
+    fi
 
     echo ""
     echo "  轮转周期:"
@@ -635,7 +667,11 @@ logrotate_add_config() {
     local postrotate_cmd
     read -r -p "$(echo -e "${CYAN}轮转后执行的命令 (可选，如重载服务，直接回车跳过): ${NC}")" postrotate_cmd
 
-    # Write config file
+    local candidate
+    candidate=$(mktemp /etc/logrotate.d/.ops-logrotate.XXXXXX) || return 1
+    chmod 0644 "$candidate"
+
+    # 先写入候选文件并验证，成功后再原子替换目标配置。
     {
         echo "${log_path} {"
         echo "    ${rotate_cycle}"
@@ -649,7 +685,20 @@ logrotate_add_config() {
             echo "    endscript"
         fi
         echo "}"
-    } > "$conf_path"
+    } > "$candidate"
+
+    if ! logrotate -d "$candidate" &>/dev/null; then
+        log_error "轮转配置验证失败，原配置保持不变"
+        logrotate -d "$candidate" 2>&1 | awk '{print "  " $0}' || true
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! mv -f "$candidate" "$conf_path"; then
+        rm -f "$candidate"
+        log_error "保存轮转配置失败"
+        return 1
+    fi
+    chmod 0644 "$conf_path"
 
     echo ""
     log_info "✓ 轮转配置已写入: ${conf_path}"
@@ -674,14 +723,14 @@ logrotate_delete_config() {
     local files=()
     while IFS= read -r f; do
         files+=("$f")
-    done < <(ls -1 /etc/logrotate.d/ 2>/dev/null)
+    done < <(find /etc/logrotate.d -maxdepth 1 -type f -name 'ops-*' -printf '%f\n' 2>/dev/null | sort)
 
     if [ ${#files[@]} -eq 0 ]; then
-        log_info "没有可删除的配置文件"
+        log_info "没有由本项目创建的可删除配置文件"
         return 0
     fi
 
-    echo "  /etc/logrotate.d/ 中的配置文件:"
+    echo "  本项目管理的 /etc/logrotate.d/ops-* 配置文件:"
     print_thin_separator
     local idx=1
     for f in "${files[@]}"; do

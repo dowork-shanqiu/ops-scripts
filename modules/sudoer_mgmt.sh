@@ -5,8 +5,8 @@
 # - 配置文件放于 /etc/sudoers.d 目录
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+SUDOER_MGMT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SUDOER_MGMT_MODULE_DIR}/common.sh"
 
 SUDOERS_DIR="/etc/sudoers.d"
 
@@ -73,7 +73,7 @@ sudoer_list() {
     echo ""
     log_info "主配置文件 (/etc/sudoers) 中的相关配置:"
     print_thin_separator
-    grep -v '^#' /etc/sudoers 2>/dev/null | grep -v '^$' | grep -v '^Defaults'
+    awk '!/^[[:space:]]*#/ && NF && !/^[[:space:]]*Defaults/' /etc/sudoers 2>/dev/null || true
     print_thin_separator
 }
 
@@ -117,7 +117,7 @@ sudoer_add() {
     local target_user
     if [ "$SELECTED_OPTION" -eq "$max_opt" ]; then
         read_nonempty "请输入用户名" target_user
-        if ! id "$target_user" &>/dev/null; then
+        if ! validate_username "$target_user" || ! id "$target_user" &>/dev/null; then
             log_error "用户 '${target_user}' 不存在"
             return 1
         fi
@@ -187,7 +187,12 @@ sudoer_add() {
     # 生成配置文件名
     local conf_file="${SUDOERS_DIR}/ops-${target_user}"
 
-    # 检查是否已存在
+    local candidate
+    candidate=$(mktemp "${SUDOERS_DIR}/.ops-${target_user}.XXXXXX") || return 1
+    chmod 0440 "$candidate"
+    chown root:root "$candidate"
+
+    # 始终先生成候选文件，验证通过后才替换原配置。
     if [ -f "$conf_file" ]; then
         log_warn "用户 '${target_user}' 已有配置文件: ${conf_file}"
         echo ""
@@ -201,31 +206,34 @@ sudoer_add() {
 
         case "$SELECTED_OPTION" in
             1)
-                echo "$rule" >> "$conf_file"
+                cp "$conf_file" "$candidate"
+                printf '%s\n' "$rule" >> "$candidate"
                 ;;
             2)
-                echo "$rule" > "$conf_file"
+                printf '%s\n' "$rule" > "$candidate"
                 ;;
             3)
+                rm -f "$candidate"
                 log_info "已取消"
                 return 0
                 ;;
         esac
     else
-        echo "$rule" > "$conf_file"
+        printf '%s\n' "$rule" > "$candidate"
     fi
 
-    # 设置正确的文件权限 (必须为 0440)
-    chmod 0440 "$conf_file"
-    chown root:root "$conf_file"
+    chmod 0440 "$candidate"
+    chown root:root "$candidate"
 
     # 验证配置
-    if visudo -cf "$conf_file" &>/dev/null; then
+    if visudo -cf "$candidate" &>/dev/null && mv -f "$candidate" "$conf_file"; then
+        chmod 0440 "$conf_file"
+        chown root:root "$conf_file"
         log_info "规则已添加并验证通过"
         log_info "配置文件: ${conf_file}"
     else
         log_error "配置验证失败，正在回滚..."
-        rm -f "$conf_file"
+        rm -f "$candidate"
         log_error "请检查规则格式是否正确"
         return 1
     fi
@@ -371,33 +379,35 @@ sudoer_edit() {
         1)
             local new_rule
             read_nonempty "请输入新的 sudoer 规则" new_rule
-            echo "$new_rule" >> "$edit_file"
-            chmod 0440 "$edit_file"
-            if visudo -cf "$edit_file" &>/dev/null; then
+            local append_tmp
+            append_tmp=$(mktemp "${SUDOERS_DIR}/.ops-edit.XXXXXX") || return 1
+            cp "$edit_file" "$append_tmp"
+            printf '%s\n' "$new_rule" >> "$append_tmp"
+            chmod 0440 "$append_tmp"
+            chown root:root "$append_tmp"
+            if visudo -cf "$append_tmp" &>/dev/null && mv -f "$append_tmp" "$edit_file"; then
                 log_info "规则已追加并验证通过"
             else
-                log_error "配置验证失败，正在移除新规则..."
-                # 移除最后一行
-                sed -i '$ d' "$edit_file"
-                chmod 0440 "$edit_file"
+                rm -f "$append_tmp"
                 log_error "请检查规则格式"
+                return 1
             fi
             ;;
         2)
             local line_num
             read_nonempty "请输入要删除的行号" line_num
             if [[ "$line_num" =~ ^[0-9]+$ ]]; then
-                # 备份
-                cp "$edit_file" "${edit_file}.bak"
-                sed -i "${line_num}d" "$edit_file"
-                chmod 0440 "$edit_file"
-                if visudo -cf "$edit_file" &>/dev/null; then
+                local delete_tmp
+                delete_tmp=$(mktemp "${SUDOERS_DIR}/.ops-edit.XXXXXX") || return 1
+                sed "${line_num}d" "$edit_file" > "$delete_tmp"
+                chmod 0440 "$delete_tmp"
+                chown root:root "$delete_tmp"
+                if visudo -cf "$delete_tmp" &>/dev/null && mv -f "$delete_tmp" "$edit_file"; then
                     log_info "行已删除，配置验证通过"
-                    rm -f "${edit_file}.bak"
                 else
-                    log_error "配置验证失败，正在回滚..."
-                    mv "${edit_file}.bak" "$edit_file"
-                    chmod 0440 "$edit_file"
+                    rm -f "$delete_tmp"
+                    log_error "配置验证失败，原配置保持不变"
+                    return 1
                 fi
             else
                 log_error "无效的行号"
